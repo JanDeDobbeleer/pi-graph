@@ -48,16 +48,22 @@ user-visible behavior change:
 
 Pick the destination by what actually broke, not by default:
 
-- Gate failure (build, test, lint) or a diff that doesn't match the spec → back to Phase 4
-  (fix via the implementer). The spec was right; the execution wasn't.
+- Gate failure (build, test, lint) or a diff that doesn't match the spec: the spec was right; the
+  execution wasn't.
+<!-- harness:enforced -->
+  → back to Phase 4 (fix via the implementer).
+<!-- /harness:enforced -->
 - Functional proof contradicts the stated root cause, or the fix didn't change the observed
-  behavior at all → back to Phase 1. The spec was built on a wrong diagnosis. Re-entering Phase 1
-  re-arms its stop gate: report the revised analysis and wait for a go again before replanning,
-  same as first entry — a Verify bounce is not a standing authorization to keep implementing
-  unattended.
+  behavior at all: the spec was built on a wrong diagnosis.
+<!-- harness:enforced -->
+  → back to Phase 1. Re-entering Phase 1 re-arms its stop gate: report the revised analysis and
+  wait for a go again before replanning, same as first entry — a Verify bounce is not a standing
+  authorization to keep implementing unattended.
+<!-- /harness:enforced -->
 
 Never weaken a gate, skip a linter, or delete a test to get to green.
 
+<!-- harness:enforced -->
 ## Retry cap
 
 There is no memory across turns other than what is written down, so the count must be carried as
@@ -76,3 +82,4 @@ send it back a fourth time. Stop the loop entirely and report to the user: the t
 the escalation question and answer, and the latest failure evidence. Continuing to cycle past that
 point means the workflow itself isn't converging on this task, and that decision belongs to the
 user, not to another escalation call.
+<!-- /harness:enforced -->

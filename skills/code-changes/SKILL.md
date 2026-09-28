@@ -9,6 +9,9 @@ description: >
 
 # Code Changes
 
+> When the pi-graph harness is running a `/change` run, the harness *is* the flow: follow its phase prompts and do not
+> re-run this skill's flow manually.
+
 The workflow for going from an issue, pull request, idea, or feature request to shipped code. Follow the phases in
 order. Analysis always comes first; code comes last.
 

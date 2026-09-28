@@ -4,7 +4,9 @@ The change is verified; now package it.
 
 ## Commits
 
+<!-- harness:enforced -->
 - Use the conventional-commit skill for every commit message.
+<!-- /harness:enforced -->
 - One logical unit per commit. A feature and its lint fallout can be separate commits when they
   answer different "why"s.
 - Stage files explicitly — never `git add -A`.

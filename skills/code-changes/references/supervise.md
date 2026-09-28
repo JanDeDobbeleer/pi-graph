@@ -2,6 +2,7 @@
 
 Delegation is not fire-and-forget. The coordinator tracks delivery and owns the outcome.
 
+<!-- harness:enforced -->
 ## Integrate before reviewing
 
 Before any diff review can happen, the merged state must exist:
@@ -17,6 +18,7 @@ Before any diff review can happen, the merged state must exist:
 When the task ran with no parallelism (single task, coordinator-direct or one implementer, no
 worktree fan-out), there is nothing to merge — this step is a no-op and the diff to review is
 simply that task's own change.
+<!-- /harness:enforced -->
 
 ## Monitor and unblock
 

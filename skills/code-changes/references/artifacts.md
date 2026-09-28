@@ -1,5 +1,6 @@
 # Artifact contract between phases
 
+<!-- harness:enforced -->
 Each phase boundary is an edge in the flow, and every edge carries one named artifact. A phase is
 not done until its artifact exists in this shape — "I finished the phase" without the artifact is
 not a valid handoff. This is what lets a phase be re-entered (from a Verify failure or an
@@ -87,6 +88,7 @@ the whole task:
 - **Answer out:** the decision and its rationale. Control and ownership return to the phase that
   asked; the answer is folded into that phase's own artifact (e.g., an escalation answered during
   Analyze becomes part of `root_cause`, not a separate deliverable).
+<!-- /harness:enforced -->
 
 ## Why this matters
 
@@ -95,7 +97,9 @@ this is what stops "I looked into it" from silently standing in for a real analy
 what lets Verify send a task back to Phase 1 or Phase 4 without the receiving phase having to
 guess what's missing.
 
+<!-- harness:enforced -->
 The same explicit-restatement convention that carries `attempt_number` across Verify failures
 applies to every other "more than once" trigger in the flow — e.g. a repeated spec gap in
 [escalate.md](escalate.md) — since none of these counters persist except as text written into the
 conversation.
+<!-- /harness:enforced -->

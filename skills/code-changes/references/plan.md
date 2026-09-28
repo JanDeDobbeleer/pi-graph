@@ -46,14 +46,22 @@ Write the spec down before delegating anything. It contains:
 
 When any tasks run in parallel worktrees, name the integration step now, before delegating:
 
-- The order branches merge back, and who executes that merge and resolves any conflict it
-  surfaces: the coordinator, at integration time in Phase 4 — never an implementer, since an
-  isolated worktree branch never sees another task's branch and so can never hit or resolve a
-  conflict against it.
+<!-- harness:enforced -->
+- The order branches merge back (`merge_plan.order`) is required whenever more than one task runs
+  in a worktree.
+<!-- /harness:enforced -->
+- Who executes that merge and resolves any conflict it surfaces: the coordinator, at integration
+  time in Phase 4 — never an implementer, since an isolated worktree branch never sees another
+  task's branch and so can never hit or resolve a conflict against it. (`merge_plan.conflict_owner`
+  is required to be non-empty; who you name there is still your judgment call.)
+<!-- harness:enforced -->
 - That Verify (Phase 5) only runs once, on the merged state, after every parallel task has landed
   — never per-branch. A per-task green run is not the gate.
+<!-- /harness:enforced -->
 
+<!-- harness:enforced -->
 ## Output of this phase
 
 A task list where each entry names its executor tier (see Phase 3), its workspace, its
 dependencies, and carries its pinned spec.
+<!-- /harness:enforced -->

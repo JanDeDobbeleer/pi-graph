@@ -38,6 +38,7 @@ or irreversible, hand the specific question to the strongest available model ins
 see [escalate.md](escalate.md). Resume ownership of the phase once the
 question is answered.
 
+<!-- harness:enforced -->
 ## Output of this phase
 
 A short analysis report to the user containing:
@@ -50,7 +51,9 @@ A short analysis report to the user containing:
 This is the `root_cause` / `proposed_change` / `out_of_scope` / `repro_status` / `open_questions`
 artifact defined in [artifacts.md](artifacts.md) — Plan reads it in that shape regardless of which
 entry point produced it.
+<!-- /harness:enforced -->
 
+<!-- harness:enforced -->
 ## Stop gate
 
 Report the analysis and wait for a go before implementing. This applies every time this phase is
@@ -58,3 +61,4 @@ entered — including a return trip from Verify (see [verify.md](verify.md)) —
 time. Skip the gate only when the user already gave the go in the request itself ("do it", "fix it
 and commit", "implement with Sonnet"). A go given for analysis is not a go for implementation, and
 a go given for the first pass does not carry forward to a re-diagnosis after a Verify failure.
+<!-- /harness:enforced -->
