@@ -1,0 +1,109 @@
+/**
+ * Tier -> provider/model mapping for the code-changes workflow, configurable per-user and
+ * per-project. Pure logic only; index.ts owns the `pi.setModel(...)` calls.
+ */
+
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { Model } from "@earendil-works/pi-ai";
+import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { ExecutorTier, Tier } from "./state.ts";
+
+/** "provider/modelId" strings. "session" (or undefined for coordinator) keeps the current session model. */
+export interface TierConfig {
+	escalation?: string;
+	coordinator?: string;
+	implementer?: string;
+	trivial?: string;
+}
+
+export const DEFAULT_TIERS: TierConfig = {
+	escalation: "anthropic/claude-fable-5-1",
+	coordinator: "session",
+	implementer: "anthropic/claude-sonnet-5",
+	trivial: "anthropic/claude-haiku-4-5",
+};
+
+function readTierConfig(file: string): TierConfig | undefined {
+	try {
+		const raw = fs.readFileSync(file, "utf8");
+		const parsed = JSON.parse(raw) as { tiers?: TierConfig };
+		if (parsed && typeof parsed === "object" && parsed.tiers && typeof parsed.tiers === "object") {
+			return parsed.tiers;
+		}
+		return undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Merge DEFAULT_TIERS <- ~/.pi/agent/code-changes.json <- <cwd>/.pi/code-changes.json.
+ * Missing or invalid config files are ignored, never thrown.
+ */
+export function loadTierConfig(cwd: string, home: string = os.homedir()): TierConfig {
+	const userConfig = readTierConfig(path.join(home, ".pi", "agent", "code-changes.json"));
+	const projectConfig = readTierConfig(path.join(cwd, ".pi", "code-changes.json"));
+	return {
+		...DEFAULT_TIERS,
+		...(userConfig ?? {}),
+		...(projectConfig ?? {}),
+	};
+}
+
+export function parseModelRef(ref: string): { provider: string; id: string } | undefined {
+	const index = ref.indexOf("/");
+	if (index <= 0 || index === ref.length - 1) return undefined;
+	return { provider: ref.slice(0, index), id: ref.slice(index + 1) };
+}
+
+export interface ResolvedTierModel {
+	model: Model<any> | undefined;
+	ref: string | undefined;
+	fellBack: boolean;
+}
+
+/**
+ * Resolve the configured model for a tier. "session"/undefined falls back to the current
+ * session model without treating it as a failed lookup. An unresolvable model reference also
+ * falls back, but with `fellBack: true` so callers can warn.
+ */
+export function resolveTierModel(
+	registry: Pick<ModelRegistry, "find">,
+	config: TierConfig,
+	tier: Tier,
+	fallback: Model<any> | undefined,
+): ResolvedTierModel {
+	const ref = config[tier];
+	if (ref === undefined || ref === "session") {
+		return { model: fallback, ref: undefined, fellBack: false };
+	}
+
+	const parsed = parseModelRef(ref);
+	if (!parsed) {
+		return { model: fallback, ref, fellBack: true };
+	}
+
+	const found = registry.find(parsed.provider, parsed.id);
+	if (!found) {
+		return { model: fallback, ref, fellBack: true };
+	}
+
+	return { model: found, ref, fellBack: false };
+}
+
+export function tierForExecutor(t: ExecutorTier): Tier {
+	switch (t) {
+		case "trivial":
+			return "trivial";
+		case "implementer":
+			return "implementer";
+		case "coordinator-direct":
+			return "coordinator";
+	}
+}
+
+export function modelRef(model: Model<any>): string {
+	return `${model.provider}/${model.id}`;
+}
