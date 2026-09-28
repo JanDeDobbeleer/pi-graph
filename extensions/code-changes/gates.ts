@@ -18,6 +18,7 @@ export const WORKFLOW_TOOLS: string[] = [
 	"submit_verification",
 	"submit_delivery",
 	"escalate",
+	"resume_task",
 ];
 
 /** Tools the model may call while in each phase. */
@@ -26,7 +27,7 @@ export const PHASE_TOOLS: Record<Phase, string[]> = {
 	awaiting_approval: ["read", "grep", "find", "ls"],
 	plan: ["read", "grep", "find", "ls", "bash", "powershell", "submit_plan"],
 	delegate: ["read", "run_delegation"],
-	supervise: ["read", "grep", "find", "ls", "bash", "powershell", "edit", "write", "escalate", "submit_review"],
+	supervise: ["read", "grep", "find", "ls", "bash", "powershell", "edit", "write", "escalate", "resume_task", "submit_review"],
 	verify: ["read", "grep", "find", "ls", "bash", "powershell", "run_gates", "escalate", "submit_verification"],
 	deliver: ["read", "grep", "ls", "bash", "powershell", "submit_delivery"],
 	// CI checks are running for the PR opened/pushed to in Deliver; the model is idle while the
@@ -146,6 +147,15 @@ function isSafeSegment(segment: string): boolean {
 // Redirections that are always safe: discarding/merging streams, never capturing output to a file.
 const ALLOWED_REDIRECTS = /(2>&1|2>\/dev\/null|>\/dev\/null|>\$null|2>\$null)/gi;
 
+/** Splits a shell command into segments the same way for every gate that reasons per-segment. */
+function splitSegments(command: string): string[] {
+	const withoutAllowedRedirects = command.replace(ALLOWED_REDIRECTS, "");
+	return withoutAllowedRedirects
+		.split(/&&|\|\||;|\||\r?\n/)
+		.map((s) => s.trim())
+		.filter((s) => s.length > 0);
+}
+
 /**
  * Conservative allowlist for read-only shell commands. When unsure, returns false.
  */
@@ -166,14 +176,101 @@ export function isReadOnlyCommand(command: string): boolean {
 	const withoutAllowedRedirects = trimmed.replace(ALLOWED_REDIRECTS, "");
 	if (/>>?/.test(withoutAllowedRedirects)) return false;
 
-	const segments = withoutAllowedRedirects
-		.split(/&&|\|\||;|\||\r?\n/)
-		.map((s) => s.trim())
-		.filter((s) => s.length > 0);
+	const segments = splitSegments(trimmed);
 	if (segments.length === 0) return false;
 
 	return segments.every((segment) => isSafeSegment(segment));
 }
+
+// ---------------------------------------------------------------------------
+// Outward actions (push / PR / GitHub replies): blocked unless the user allowed them
+// (deliver.md), even outside read-only phases. Force push always needs --force-with-lease.
+// Explicit broad staging is blocked in supervise/verify/deliver (deliver.md: stage explicitly).
+// ---------------------------------------------------------------------------
+
+const OUTWARD_PATTERNS: RegExp[] = [
+	/^git\s+push\b/i,
+	/^gh\s+pr\s+create\b/i,
+	/^gh\s+pr\s+comment\b/i,
+	/^gh\s+pr\s+review\b/i,
+	/^gh\s+pr\s+merge\b/i,
+	/^gh\s+issue\s+comment\b/i,
+	/^gh\s+issue\s+close\b/i,
+];
+
+const MUTATING_METHODS = new Set(["POST", "PATCH", "PUT", "DELETE"]);
+
+function isMutatingGhApi(segment: string): boolean {
+	const tokens = segment.trim().split(/\s+/);
+	if ((tokens[0] ?? "").toLowerCase() !== "gh" || (tokens[1] ?? "").toLowerCase() !== "api") return false;
+	let method: string | undefined;
+	let hasFieldFlag = false;
+	for (let i = 2; i < tokens.length; i++) {
+		const tok = tokens[i];
+		if (tok === "-X" || tok === "--method") {
+			method = tokens[i + 1]?.toUpperCase();
+			i++;
+			continue;
+		}
+		if (tok.startsWith("-X") && tok.length > 2) {
+			method = tok.slice(2).toUpperCase();
+			continue;
+		}
+		if (tok.startsWith("--method=")) {
+			method = tok.slice("--method=".length).toUpperCase();
+			continue;
+		}
+		if (tok === "-f" || tok === "-F" || tok === "--field" || tok === "--raw-field") {
+			hasFieldFlag = true;
+		}
+	}
+	if (method) return MUTATING_METHODS.has(method);
+	// No explicit method: gh api defaults to POST once -f/-F/--field/--raw-field is used.
+	return hasFieldFlag;
+}
+
+function isOutwardSegment(segment: string): boolean {
+	const trimmed = segment.trim();
+	return OUTWARD_PATTERNS.some((re) => re.test(trimmed)) || isMutatingGhApi(trimmed);
+}
+
+/** First outward-action segment in `command`, if any (push, PR/issue mutation, mutating `gh api`). */
+export function findOutwardSegment(command: string): string | undefined {
+	if (typeof command !== "string") return undefined;
+	return splitSegments(command).find(isOutwardSegment);
+}
+
+function isForcePushWithoutLease(segment: string): boolean {
+	if (!/^git\s+push\b/i.test(segment)) return false;
+	const tokens = segment.trim().split(/\s+/);
+	const hasLease = tokens.some((t) => t === "--force-with-lease" || t.startsWith("--force-with-lease="));
+	const hasForce = tokens.some((t) => t === "--force" || t === "-f");
+	return hasForce && !hasLease;
+}
+
+/** First `git push --force`/`-f` (without `--force-with-lease`) segment in `command`, if any. */
+export function findForcePushWithoutLease(command: string): string | undefined {
+	if (typeof command !== "string") return undefined;
+	return splitSegments(command).find(isForcePushWithoutLease);
+}
+
+const BROAD_STAGING_PATTERNS: RegExp[] = [
+	/^git\s+add\s+(-A\b|--all\b|\.(\s|$)|:\/(\s|$))/i,
+	/^git\s+commit\s+(-a\b|-am\b|--all\b)/i,
+];
+
+function isBroadStagingSegment(segment: string): boolean {
+	return BROAD_STAGING_PATTERNS.some((re) => re.test(segment.trim()));
+}
+
+/** First broad-staging segment (`git add -A`/`.`/`:/`, `git commit -a`/`-am`/`--all`) in `command`, if any. */
+export function findBroadStagingSegment(command: string): string | undefined {
+	if (typeof command !== "string") return undefined;
+	return splitSegments(command).find(isBroadStagingSegment);
+}
+
+/** Phases where Supervise/Verify/Deliver's "stage files explicitly" rule (deliver.md) applies. */
+export const STAGING_RESTRICTED_PHASES: Phase[] = ["supervise", "verify", "deliver"];
 
 export type GateDecision = { block: true; reason: string } | undefined;
 
@@ -223,13 +320,36 @@ export function decideToolCall(state: WorkflowState | undefined, toolName: strin
 		};
 	}
 
-	if ((toolName === "bash" || toolName === "powershell") && READ_ONLY_PHASES.includes(phase)) {
+	if (toolName === "bash" || toolName === "powershell") {
 		const command = typeof input.command === "string" ? input.command : "";
-		if (!isReadOnlyCommand(command)) {
+
+		if (READ_ONLY_PHASES.includes(phase) && !isReadOnlyCommand(command)) {
 			const label = PHASE_LABEL[phase];
 			return {
 				block: true,
 				reason: `${label} is read-only: only inspection commands are allowed until ${nextStepReason(phase, state)}.`,
+			};
+		}
+
+		if (!state.pushAllowed && findOutwardSegment(command)) {
+			return {
+				block: true,
+				reason: "Blocked: pushing / PR / GitHub replies need the user's go. Ask the user to run /change allow-push.",
+			};
+		}
+
+		// Even when pushAllowed: a rewritten branch must never be force-pushed without --force-with-lease.
+		if (findForcePushWithoutLease(command)) {
+			return {
+				block: true,
+				reason: "Blocked: force push without --force-with-lease. A rewritten branch must be pushed with --force-with-lease (deliver.md).",
+			};
+		}
+
+		if (STAGING_RESTRICTED_PHASES.includes(phase) && findBroadStagingSegment(command)) {
+			return {
+				block: true,
+				reason: "Blocked: stage files explicitly (deliver.md). `git add -A`/`--all`/`.`/`:/` and `git commit -a`/`-am`/`--all` are not allowed here.",
 			};
 		}
 	}

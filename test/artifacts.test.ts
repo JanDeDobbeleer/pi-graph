@@ -13,13 +13,16 @@ import {
 	applyDelivery,
 	buildPackets,
 	summarizeState,
+	formatAnalysis,
+	parseAnalysisMarkdown,
 	ArtifactError,
 	type PlanParams,
 	type AnalysisParams,
 } from "../extensions/code-changes/artifacts.ts";
+import type { AnalysisReport } from "../extensions/code-changes/state.ts";
 
 function baseState(overrides: Partial<WorkflowState> = {}): WorkflowState {
-	return { ...newState("do the thing", [], "deadbeef", false), ...overrides };
+	return { ...newState("do the thing", [], "deadbeef"), ...overrides };
 }
 
 function analysis(overrides: Partial<AnalysisParams> = {}): AnalysisParams {
@@ -87,6 +90,92 @@ describe("applyAnalysis", () => {
 		const result = applyAnalysis(s, analysis());
 		expect(result.analysis!.root_cause).toContain("Escalation decisions");
 		expect(result.analysis!.root_cause).toContain("use approach B");
+	});
+});
+
+function report(overrides: Partial<AnalysisReport> = {}): AnalysisReport {
+	return {
+		root_cause: "greeting.txt says Hello instead of Hi",
+		proposed_change: "change the greeting text to Hi",
+		out_of_scope: "nothing else",
+		repro_status: "reproduced: read greeting.txt",
+		open_questions: [],
+		...overrides,
+	};
+}
+
+describe("formatAnalysis / parseAnalysisMarkdown", () => {
+	it("round-trips a report with no open questions", () => {
+		const a = report();
+		expect(parseAnalysisMarkdown(formatAnalysis(a))).toEqual(a);
+	});
+
+	it("round-trips a report with open questions, listed first", () => {
+		const a = report({ open_questions: ["what about X?", "and Y?"] });
+		const md = formatAnalysis(a);
+		expect(md.indexOf("Open questions")).toBeLessThan(md.indexOf("Root cause"));
+		expect(parseAnalysisMarkdown(md)).toEqual(a);
+	});
+
+	it("marks the edited-by-you note without breaking the round trip", () => {
+		const a = report();
+		const md = formatAnalysis(a, { edited: true });
+		expect(md).toContain("edited by you");
+		expect(parseAnalysisMarkdown(md)).toEqual(a);
+	});
+
+	it("tolerates reordered sections", () => {
+		const a = report({ open_questions: ["Q1"] });
+		const md = formatAnalysis(a);
+		const sections = md.split(/(?=^## )/m).map((s) => s.replace(/\s+$/, ""));
+		const reordered = [sections[0], ...sections.slice(1).reverse()].join("\n\n");
+		expect(parseAnalysisMarkdown(reordered)).toEqual(a);
+	});
+
+	it("tolerates a missing optional section (out_of_scope)", () => {
+		const a = report({ out_of_scope: "" });
+		const md = formatAnalysis(a).replace(/## Out of scope\n?/, "").replace("nothing else", "");
+		const parsed = parseAnalysisMarkdown(md);
+		expect(parsed.out_of_scope).toBe("");
+		expect(parsed.root_cause).toBe(a.root_cause);
+	});
+
+	it("throws ArtifactError naming a missing required section", () => {
+		const md = formatAnalysis(report()).replace(/## Root cause\n[\s\S]*?(?=\n## )/, "");
+		expect(() => parseAnalysisMarkdown(md)).toThrow(ArtifactError);
+		try {
+			parseAnalysisMarkdown(md);
+			throw new Error("expected parseAnalysisMarkdown to throw");
+		} catch (err) {
+			expect(err).toBeInstanceOf(ArtifactError);
+			expect((err as ArtifactError).message).toContain("Root cause");
+		}
+	});
+
+	it("throws ArtifactError naming all missing required sections", () => {
+		expect(() => parseAnalysisMarkdown("# Analysis\n\nno sections at all")).toThrow(/Root cause.*Proposed change.*Repro status/s);
+	});
+
+	it("ignores prose outside any section and parses only '- ' bullets as open questions", () => {
+		const md = [
+			"# Analysis",
+			"",
+			"Some free-form note the human left here.",
+			"",
+			"## Open questions",
+			"- real question",
+			"not a bullet, ignored",
+			"",
+			"## Root cause",
+			"rc",
+			"## Proposed change",
+			"pc",
+			"## Repro status",
+			"rs",
+		].join("\n");
+		const parsed = parseAnalysisMarkdown(md);
+		expect(parsed.open_questions).toEqual(["real question"]);
+		expect(parsed.root_cause).toBe("rc");
 	});
 });
 

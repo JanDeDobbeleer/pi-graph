@@ -1,9 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { decideToolCall, isReadOnlyCommand, PHASE_TOOLS, WORKFLOW_TOOLS } from "../extensions/code-changes/gates.ts";
+import {
+	decideToolCall,
+	findBroadStagingSegment,
+	findForcePushWithoutLease,
+	findOutwardSegment,
+	isReadOnlyCommand,
+	PHASE_TOOLS,
+	WORKFLOW_TOOLS,
+} from "../extensions/code-changes/gates.ts";
 import { newState, type WorkflowState } from "../extensions/code-changes/state.ts";
 
 function stateInPhase(phase: WorkflowState["phase"]): WorkflowState {
-	const s = newState("do a thing", ["read", "edit", "bash"], "deadbeef", false);
+	const s = newState("do a thing", ["read", "edit", "bash"], "deadbeef");
 	return { ...s, phase };
 }
 
@@ -125,5 +133,111 @@ describe("decideToolCall", () => {
 				expect(() => decideToolCall(state, tool, { command: "git status" })).not.toThrow();
 			}
 		}
+	});
+
+	// -------------------------------------------------------------------------
+	// Outward actions (push / PR / GitHub replies), force-with-lease, explicit staging
+	// -------------------------------------------------------------------------
+
+	describe("findOutwardSegment", () => {
+		it.each([
+			"git push",
+			"git push origin main",
+			"gh pr create --title x",
+			"gh pr comment 1 --body hi",
+			"gh pr review 1 --approve",
+			"gh pr merge 1",
+			"gh issue comment 1 --body hi",
+			"gh issue close 1",
+			"gh api repos/acme/widgets/issues/1/comments -f body=hi",
+			"gh api -X POST repos/acme/widgets/pulls/1/reviews",
+			"gh api --method PATCH repos/acme/widgets/issues/1",
+		])("flags %s", (command) => {
+			expect(findOutwardSegment(command)).toBeDefined();
+		});
+
+		it.each(["git status", "git log", "gh pr view 1", "gh api repos/acme/widgets -X GET", "gh api repos/acme/widgets"])(
+			"does not flag %s",
+			(command) => {
+				expect(findOutwardSegment(command)).toBeUndefined();
+			},
+		);
+	});
+
+	describe("findForcePushWithoutLease", () => {
+		it.each(["git push --force", "git push -f origin main", "git push origin main --force"])("flags %s", (command) => {
+			expect(findForcePushWithoutLease(command)).toBeDefined();
+		});
+
+		it.each(["git push", "git push --force-with-lease", "git push --force --force-with-lease"])("does not flag %s", (command) => {
+			expect(findForcePushWithoutLease(command)).toBeUndefined();
+		});
+	});
+
+	describe("findBroadStagingSegment", () => {
+		it.each(["git add -A", "git add --all", "git add .", "git add :/", "git commit -a -m x", "git commit -am x", "git commit --all -m x"])(
+			"flags %s",
+			(command) => {
+				expect(findBroadStagingSegment(command)).toBeDefined();
+			},
+		);
+
+		it.each(["git add file.txt", "git commit -m x", "git status"])("does not flag %s", (command) => {
+			expect(findBroadStagingSegment(command)).toBeUndefined();
+		});
+	});
+
+	describe("push/PR/reply gate", () => {
+		it("blocks git push in deliver when pushAllowed is false", () => {
+			const state = { ...stateInPhase("deliver"), pushAllowed: false };
+			const decision = decideToolCall(state, "bash", { command: "git push origin main" });
+			expect(decision?.block).toBe(true);
+			expect(decision?.reason).toContain("allow-push");
+		});
+
+		it("allows git push in deliver when pushAllowed is true", () => {
+			const state = { ...stateInPhase("deliver"), pushAllowed: true };
+			const decision = decideToolCall(state, "bash", { command: "git push origin main" });
+			expect(decision).toBeUndefined();
+		});
+
+		it("blocks gh pr create in deliver when pushAllowed is false", () => {
+			const state = { ...stateInPhase("deliver"), pushAllowed: false };
+			const decision = decideToolCall(state, "powershell", { command: "gh pr create --title x --body y" });
+			expect(decision?.block).toBe(true);
+		});
+
+		it("blocks force push without --force-with-lease even when pushAllowed", () => {
+			const state = { ...stateInPhase("deliver"), pushAllowed: true };
+			const decision = decideToolCall(state, "bash", { command: "git push --force origin main" });
+			expect(decision?.block).toBe(true);
+			expect(decision?.reason).toContain("force-with-lease");
+		});
+
+		it("allows force-with-lease push when pushAllowed", () => {
+			const state = { ...stateInPhase("deliver"), pushAllowed: true };
+			const decision = decideToolCall(state, "bash", { command: "git push --force-with-lease origin main" });
+			expect(decision).toBeUndefined();
+		});
+
+		it("blocks explicit broad staging in supervise/verify/deliver", () => {
+			for (const phase of ["supervise", "verify", "deliver"] as const) {
+				const state = stateInPhase(phase);
+				expect(decideToolCall(state, "bash", { command: "git add -A" })?.block).toBe(true);
+				expect(decideToolCall(state, "bash", { command: 'git commit -am "wip"' })?.block).toBe(true);
+			}
+		});
+
+		it("allows explicit staging by filename in supervise/verify/deliver", () => {
+			for (const phase of ["supervise", "verify", "deliver"] as const) {
+				const state = stateInPhase(phase);
+				expect(decideToolCall(state, "bash", { command: "git add greeting.txt" })).toBeUndefined();
+			}
+		});
+
+		it("does not apply the push/staging gates when no run is active", () => {
+			expect(decideToolCall(undefined, "bash", { command: "git push --force origin main" })).toBeUndefined();
+			expect(decideToolCall(undefined, "bash", { command: "git add -A" })).toBeUndefined();
+		});
 	});
 });

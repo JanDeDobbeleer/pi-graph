@@ -33,6 +33,9 @@ export const PHASE_LABEL: Record<Phase, string> = {
 	stopped: "Stopped",
 };
 
+/** Which Phase 1 door the task came in through (SKILL.md "Special cases"). */
+export type EntryKind = "analyze" | "issue-triage" | "pr-review-comments";
+
 export type Tier = "escalation" | "coordinator" | "implementer" | "trivial";
 export type ExecutorTier = "trivial" | "implementer" | "coordinator-direct";
 
@@ -83,6 +86,14 @@ export interface TaskRun {
 	error?: string;
 	merged?: boolean;
 	conflict?: boolean;
+	/** Spec gaps the implementer reported (lines starting with "SPEC GAP:"), across all attempts. */
+	spec_gaps?: string[];
+	/** True when the implementer was killed for exceeding its time budget. */
+	stalled?: boolean;
+	/** True once repeated spec gaps on this task were escalated (escalate.md trigger). */
+	escalated?: boolean;
+	/** How many times the coordinator resumed this task with an answer (resume_task). */
+	resumes?: number;
 }
 
 // Supervise → Verify
@@ -183,6 +194,14 @@ export interface WorkflowState {
 	baselineTools: string[];
 	/** Set when the user gave the go in the request itself (`/change --approved`). */
 	preApproved: boolean;
+	/** Phase 1 entry point; selects the Analyze reference and Deliver extras. */
+	entry: EntryKind;
+	/** Issue or PR number/URL for the issue-triage / pr-review-comments entries. */
+	entryRef?: string;
+	/** Push, PR creation and PR/issue replies are blocked unless the user allowed them. */
+	pushAllowed: boolean;
+	/** True when the human edited the analysis at the approval gate. */
+	analysisEditedByHuman?: boolean;
 	analysis?: AnalysisReport;
 	plan?: TaskList;
 	packets: DelegationPacket[];
@@ -206,14 +225,24 @@ export interface WorkflowState {
 	phasePromptSent: boolean;
 }
 
-export function newState(task: string, baselineTools: string[], baseRef: string | undefined, preApproved: boolean): WorkflowState {
+export interface NewStateOptions {
+	preApproved?: boolean;
+	entry?: EntryKind;
+	entryRef?: string;
+	pushAllowed?: boolean;
+}
+
+export function newState(task: string, baselineTools: string[], baseRef: string | undefined, opts: NewStateOptions = {}): WorkflowState {
 	return {
 		id: Date.now().toString(36),
 		task,
 		phase: "analyze",
 		baseRef,
 		baselineTools,
-		preApproved,
+		preApproved: opts.preApproved ?? false,
+		entry: opts.entry ?? "analyze",
+		entryRef: opts.entryRef,
+		pushAllowed: opts.pushAllowed ?? false,
 		packets: [],
 		runs: [],
 		lastGates: [],
@@ -231,7 +260,8 @@ export function isActive(state: WorkflowState | undefined): state is WorkflowSta
 /** Legal edges of the graph. Transitions outside this table are bugs. */
 export const EDGES: Record<Phase, Phase[]> = {
 	analyze: ["awaiting_approval", "plan", "stopped"],
-	awaiting_approval: ["plan", "analyze", "stopped"],
+	// "done" here is the issue-triage deliverable: the analysis itself was the product.
+	awaiting_approval: ["plan", "analyze", "done", "stopped"],
 	plan: ["delegate", "stopped"],
 	delegate: ["supervise", "stopped"],
 	supervise: ["verify", "stopped"],

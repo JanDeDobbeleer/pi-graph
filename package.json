@@ -4,11 +4,21 @@
   "description": "The code-changes workflow (analyze, plan, delegate, supervise, verify, deliver) as a pi extension with phases enforced by code.",
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi-package"],
-  "files": ["extensions", "skills", "README.md"],
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "extensions",
+    "skills",
+    "README.md"
+  ],
   "pi": {
-    "extensions": ["./extensions/code-changes/index.ts"],
-    "skills": ["./skills"]
+    "extensions": [
+      "./extensions/code-changes/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -17,11 +27,13 @@
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "0.87.1",
     "@earendil-works/pi-coding-agent": "0.87.1",
+    "@earendil-works/pi-tui": "0.87.1",
     "@types/node": "^22.0.0",
     "typebox": "*",
     "typescript": "^5.9.0",

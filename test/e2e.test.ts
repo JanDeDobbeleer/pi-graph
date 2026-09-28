@@ -240,10 +240,25 @@ describe("code-changes e2e (real pi runtime, scripted fake model)", () => {
 				expect(blockedText.toLowerCase()).toMatch(/not found|analyze/);
 
 				// --- awaiting_approval: no UI in this session, so the run parks; /change approve continues it. ---
+				// The analysis must already be a real "code-changes-analysis" custom message entry in
+				// the session -- not merely something the model happened to see -- and it must be there
+				// *before* the approval choice is ever made (agent_settled appends it synchronously,
+				// unlike the old agent_end path where sendMessage(..., {triggerTurn:false}) while
+				// streaming only queued it for the end of the turn).
+				const analysisEntry = session.sessionManager
+					.getBranch()
+					.find((e: any) => e.type === "custom_message" && e.customType === "code-changes-analysis");
+				expect(analysisEntry).toBeDefined();
+				const analysisText =
+					typeof (analysisEntry as any).content === "string"
+						? (analysisEntry as any).content
+						: ((analysisEntry as any).content ?? []).map((c: any) => c.text ?? "").join(" ");
+				expect(analysisText).toContain("greeting.txt says Hello instead of Hi");
+
 				const readyMessage = session.messages.find((m) => {
 					const content = (m as any).content;
 					const text = typeof content === "string" ? content : Array.isArray(content) ? content.map((c: any) => c.text ?? "").join(" ") : "";
-					return /ready for approval/i.test(text);
+					return (m as any).customType === "code-changes-analysis" && /root cause/i.test(text);
 				});
 				expect(readyMessage).toBeDefined();
 
@@ -271,8 +286,9 @@ describe("code-changes e2e (real pi runtime, scripted fake model)", () => {
 				// ...then the model runs the required gate and passes for real.
 				queue.push({ tool: "run_gates", args: { commands: ['node -e "process.exit(0)"'] } });
 				queue.push({ tool: "submit_verification", args: { outcome: "pass", functional_proof: "read greeting.txt: Hi" } });
-				// Deliver: commit with a conventional-commit subject, then report.
-				queue.push({ tool: "bash", args: { command: 'git add -A && git commit -m "fix: greeting"' } });
+				// Deliver: stage the changed file explicitly (git add -A is blocked here) and commit
+				// with a conventional-commit subject, then report.
+				queue.push({ tool: "bash", args: { command: 'git add greeting.txt && git commit -m "fix: greeting"' } });
 				queue.push({ tool: "submit_delivery", args: { report: "Changed the greeting from Hello to Hi." } });
 
 				await session.prompt("/change approve");

@@ -9,6 +9,8 @@
  */
 
 import { Type } from "typebox";
+import { Markdown } from "@earendil-works/pi-tui";
+import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import type {
 	AgentBeforeSettleEventResult,
 	BeforeAgentStartEventResult,
@@ -32,6 +34,8 @@ import {
 	applyReview,
 	applyVerification,
 	buildPackets,
+	formatAnalysis,
+	parseAnalysisMarkdown,
 	requiredGateCommands,
 	resolveEscalatedFailure,
 	validateCommitSubjects,
@@ -43,6 +47,7 @@ import { decideToolCall, READ_ONLY_PHASES, toolsForPhase, WORKFLOW_TOOLS } from 
 import { discoverStopHooks, findRepoRoot, formatHookFeedback, hooksBlocked, runStopHooks, StopHookGuard, type StopHook } from "./hooks.ts";
 import { loadTierConfig, modelRef, resolveTierModel, tierForExecutor } from "./models.ts";
 import { phasePrompt, phaseReminder } from "./prompts.ts";
+import { createResumeTaskTool, escalateSpecGaps, needsSpecGapEscalation, type ResumeDeps } from "./resume.ts";
 import { git, runShell } from "./runner.ts";
 import {
 	newState,
@@ -51,6 +56,8 @@ import {
 	STATE_ENTRY,
 	transition,
 	isActive,
+	type AnalysisReport,
+	type EntryKind,
 	type FailureRecord,
 	type GateResult,
 	type Phase,
@@ -68,6 +75,18 @@ const CI_FIX_CAP = 2;
 
 export default function codeChanges(pi: ExtensionAPI): void {
 	let state: WorkflowState | undefined;
+
+	// -------------------------------------------------------------------------
+	// "code-changes-analysis" messages render as Markdown in the transcript. pi supplies
+	// @earendil-works/pi-tui to extensions (docs/packages.md), so it is a peer dependency.
+	// -------------------------------------------------------------------------
+
+	pi.registerMessageRenderer<AnalysisReport>("code-changes-analysis", (message) => {
+		const text = typeof message.content === "string"
+			? message.content
+			: message.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
+		return new Markdown(text, 1, 0, getMarkdownTheme());
+	});
 
 	// -------------------------------------------------------------------------
 	// Stop hooks: discovered once per session_start (cached), re-discovered on /change start.
@@ -154,6 +173,25 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		applyPhaseTools();
 		persist();
 		updateStatus(ctx);
+	}
+
+	// -------------------------------------------------------------------------
+	// Escalation side-call, shared by submit_verification, escalate, and resume_task's
+	// repeated-spec-gap trigger (resume.ts's ResumeDeps.escalate).
+	// -------------------------------------------------------------------------
+
+	async function runResumeEscalation(
+		q: { question: string; evidence: string; hypothesis: string },
+		ctx: ExtensionContext,
+		signal?: AbortSignal,
+	): Promise<{ decision: string; model: string }> {
+		const config = loadTierConfig(ctx.cwd);
+		const resolved = resolveTierModel(ctx.modelRegistry, config, "escalation", ctx.model);
+		if (!resolved.model) {
+			throw new Error("escalate: no model resolved for the escalation tier.");
+		}
+		const { decision } = await runEscalation(ctx.modelRegistry, resolved.model, { phase: "supervise", ...q }, signal);
+		return { decision, model: modelRef(resolved.model) };
 	}
 
 	// -------------------------------------------------------------------------
@@ -344,13 +382,179 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	}
 
 	// -------------------------------------------------------------------------
+	// Approval gate: entered from agent_settled (so the analysis message renders before the
+	// dialog opens -- see the agent_settled handler below) and re-openable via /change show.
+	// -------------------------------------------------------------------------
+
+	function sendAnalysisMessage(current: WorkflowState): void {
+		if (!current.analysis) return;
+		pi.sendMessage(
+			{
+				customType: "code-changes-analysis",
+				content: formatAnalysis(current.analysis, { edited: current.analysisEditedByHuman }),
+				display: true,
+				details: current.analysis,
+			},
+			{ triggerTurn: false },
+		);
+	}
+
+	const NO_UI_GATE_HINT = "code-changes: analysis ready. Run /change approve, /change show or /change revise <feedback>.";
+
+	async function openApprovalGate(ctx: ExtensionContext, opts?: { resend?: boolean }): Promise<void> {
+		if (!state || state.phase !== "awaiting_approval") return;
+		if ((opts?.resend ?? true) && state.analysis) sendAnalysisMessage(state);
+
+		if (!ctx.hasUI) {
+			ctx.ui.notify(NO_UI_GATE_HINT, "info");
+			return;
+		}
+
+		const options = ["Approve", "Approve and allow push/PR", "Edit the analysis myself", "Send feedback to revise"];
+		if (state.entry === "issue-triage") options.push("Done — triage only");
+		options.push("Stop the run");
+
+		const choice = await ctx.ui.select("Review the analysis above — what next?", options);
+		if (!state || state.phase !== "awaiting_approval") return; // state moved on while the dialog was open
+
+		if (choice === undefined) {
+			ctx.ui.notify(`code-changes: run /change approve, /change show or /change revise <feedback>.`, "info");
+			return; // cancelled: leave the run awaiting
+		}
+
+		if (choice === "Approve") {
+			setState(transition(state, "plan"), ctx);
+			await enterPhase(ctx);
+			return;
+		}
+
+		if (choice === "Approve and allow push/PR") {
+			const allowed = { ...state, pushAllowed: true };
+			setState(transition(allowed, "plan"), ctx);
+			await enterPhase(ctx);
+			return;
+		}
+
+		if (choice === "Edit the analysis myself") {
+			const prefill = formatAnalysis(state.analysis!, { edited: state.analysisEditedByHuman });
+			const edited = await ctx.ui.editor("Edit the analysis", prefill);
+			if (!state || state.phase !== "awaiting_approval") return;
+			if (!edited?.trim()) {
+				await openApprovalGate(ctx, { resend: false });
+				return;
+			}
+			try {
+				const parsed = parseAnalysisMarkdown(edited);
+				const next = { ...state, analysis: parsed, analysisEditedByHuman: true };
+				setState(next, ctx); // edits don't auto-approve: re-render + re-open the gate
+				await openApprovalGate(ctx);
+			} catch (err) {
+				const message = err instanceof ArtifactError ? err.message : err instanceof Error ? err.message : String(err);
+				ctx.ui.notify(`code-changes: could not parse the edited analysis: ${message}`, "warning");
+				await openApprovalGate(ctx, { resend: false });
+			}
+			return;
+		}
+
+		if (choice === "Send feedback to revise") {
+			const feedback = await ctx.ui.editor("Revise the analysis:", "");
+			if (!state) return;
+			setState(transition(state, "analyze"), ctx);
+			await enterPhase(ctx, feedback?.trim());
+			return;
+		}
+
+		if (choice === "Done — triage only") {
+			const report = `Triage complete — no implementation performed.\n\n${formatAnalysis(state.analysis!, { edited: state.analysisEditedByHuman })}`;
+			const withDelivery = {
+				...state,
+				delivery: {
+					commits: [],
+					no_commit_reason: "issue-triage entry: the analysis is the deliverable, no implementation was performed.",
+					report,
+				},
+			};
+			setState(transition(withDelivery, "done"), ctx);
+			await enterPhase(ctx);
+			return;
+		}
+
+		if (choice === "Stop the run") {
+			const stopped = { ...state, stopReason: "stopped by user at the approval gate" };
+			setState(transition(stopped, "stopped"), ctx);
+			await enterPhase(ctx);
+			return;
+		}
+	}
+
+	// -------------------------------------------------------------------------
 	// /change command
 	// -------------------------------------------------------------------------
 
-	const SUBCOMMANDS = ["status", "approve", "revise", "abort", "cleanup", "watch"];
+	const SUBCOMMANDS = ["status", "approve", "revise", "abort", "cleanup", "watch", "show", "triage", "review", "allow-push"];
+
+	/** Parses `--approved`/`--push` flags (any order, any combination) preceding the rest of the args. */
+	function parseFlags(args: string): { preApproved: boolean; pushAllowed: boolean; remainder: string } {
+		let preApproved = false;
+		let pushAllowed = false;
+		let remainder = args.trim();
+		for (;;) {
+			if (remainder === "--approved" || remainder.startsWith("--approved ")) {
+				preApproved = true;
+				remainder = remainder.slice("--approved".length).trim();
+				continue;
+			}
+			if (remainder === "--push" || remainder.startsWith("--push ")) {
+				pushAllowed = true;
+				remainder = remainder.slice("--push".length).trim();
+				continue;
+			}
+			break;
+		}
+		return { preApproved, pushAllowed, remainder };
+	}
+
+	/** Shared by the plain `/change <task>`, `/change triage <issue>` and `/change review <pr>` forms. */
+	async function startRun(
+		ctx: ExtensionCommandContext,
+		task: string,
+		opts: { preApproved: boolean; pushAllowed: boolean; entry?: EntryKind; entryRef?: string },
+	): Promise<void> {
+		if (isActive(state)) {
+			if (!ctx.hasUI) {
+				ctx.ui.notify("code-changes: a run is already active; use /change abort first.", "error");
+				return;
+			}
+			const replace = await ctx.ui.confirm(
+				"Replace active run?",
+				`A code-changes run is already active (phase ${PHASE_LABEL[state.phase]}). Start a new one instead?`,
+			);
+			if (!replace) return;
+			if (state.pr) ciWatcher.stop(state.pr.number);
+			const aborted = { ...state, stopReason: "replaced by a new /change run" };
+			const stopped = transition(aborted, "stopped");
+			await cleanupWorktrees(stopped.runs, ctx.cwd);
+		}
+
+		await discoverHooks(ctx.cwd, true);
+
+		const baseRefResult = await git(["rev-parse", "HEAD"], ctx.cwd);
+		const baseRef = baseRefResult.code === 0 ? baseRefResult.stdout.trim() : undefined;
+		const baselineTools = pi.getActiveTools().filter((name) => !WORKFLOW_TOOLS.includes(name));
+		const next = newState(task, baselineTools, baseRef, {
+			preApproved: opts.preApproved,
+			pushAllowed: opts.pushAllowed,
+			entry: opts.entry,
+			entryRef: opts.entryRef,
+		});
+		setState(next, ctx);
+		await enterPhase(ctx);
+	}
 
 	pi.registerCommand("change", {
-		description: "Start or control the code-changes workflow: /change <task>, or status/approve/revise/abort/cleanup/watch",
+		description:
+			"Start or control the code-changes workflow: /change [--approved] [--push] <task>, /change triage|review [--approved] [--push] <ref>, " +
+			"or status/approve/revise/abort/cleanup/watch/show/allow-push",
 		getArgumentCompletions(argumentPrefix: string) {
 			return SUBCOMMANDS.filter((s) => s.startsWith(argumentPrefix)).map((s) => ({ value: s, label: s }));
 		},
@@ -433,43 +637,80 @@ export default function codeChanges(pi: ExtensionAPI): void {
 				return;
 			}
 
-			// Otherwise: [--approved] <task>
-			let preApproved = false;
-			let task = trimmed;
-			if (trimmed.startsWith("--approved")) {
-				preApproved = true;
-				task = trimmed.slice("--approved".length).trim();
-			}
-
-			if (!task) {
-				ctx.ui.notify("code-changes: usage: /change [--approved] <task>, or /change status|approve|revise|abort|cleanup", "warning");
+			if (first === "allow-push") {
+				if (!isActive(state)) {
+					ctx.ui.notify("code-changes: no active run.", "info");
+					return;
+				}
+				state = { ...state, pushAllowed: true };
+				persist();
+				ctx.ui.notify("code-changes: push, PR creation and PR/issue replies are now allowed for this run.", "info");
 				return;
 			}
 
-			if (isActive(state)) {
-				if (!ctx.hasUI) {
-					ctx.ui.notify("code-changes: a run is already active; use /change abort first.", "error");
+			if (first === "show") {
+				if (!state) {
+					ctx.ui.notify("code-changes: no active run.", "info");
 					return;
 				}
-				const replace = await ctx.ui.confirm(
-					"Replace active run?",
-					`A code-changes run is already active (phase ${PHASE_LABEL[state.phase]}). Start a new one instead?`,
-				);
-				if (!replace) return;
-				if (state.pr) ciWatcher.stop(state.pr.number);
-				const aborted = { ...state, stopReason: "replaced by a new /change run" };
-				const stopped = transition(aborted, "stopped");
-				await cleanupWorktrees(stopped.runs, ctx.cwd);
+				if (state.analysis) sendAnalysisMessage(state);
+				if (state.plan) {
+					const lines = [
+						"# Plan task list",
+						...state.plan.tasks.map((t) => `- ${t.id} [${t.executor_tier}/${t.workspace}] deps=${t.dependencies.join(",") || "none"}`),
+					];
+					pi.sendMessage({ customType: "code-changes-phase", content: lines.join("\n"), display: true }, { triggerTurn: false });
+				}
+				if (state.review) {
+					const lines = [
+						"# Reviewed diff summary",
+						`overrides: ${state.review.overrides.join("; ") || "none"}`,
+						`tests_kept: ${state.review.tests_kept.join("; ") || "none"}`,
+						`tests_cut: ${state.review.tests_cut.join("; ") || "none"}`,
+					];
+					pi.sendMessage({ customType: "code-changes-phase", content: lines.join("\n"), display: true }, { triggerTurn: false });
+				}
+				const lastFailure = state.failures[state.failures.length - 1];
+				if (lastFailure) {
+					pi.sendMessage(
+						{
+							customType: "code-changes-phase",
+							content: `# Last failure\nAttempt ${lastFailure.attempt_number}: ${lastFailure.failure_class} -> ${lastFailure.destination}. ${lastFailure.summary}`,
+							display: true,
+						},
+						{ triggerTurn: false },
+					);
+				}
+				if (state.phase === "awaiting_approval" && ctx.hasUI) {
+					await openApprovalGate(ctx, { resend: false });
+				}
+				return;
 			}
 
-			await discoverHooks(ctx.cwd, true);
+			if (first === "triage" || first === "review") {
+				const { preApproved, pushAllowed, remainder } = parseFlags(restText);
+				if (!remainder) {
+					ctx.ui.notify(`code-changes: usage: /change ${first} [--approved] [--push] <${first === "triage" ? "issue" : "pr"}> [notes]`, "warning");
+					return;
+				}
+				const [ref, ...noteWords] = remainder.split(/\s+/);
+				const notes = noteWords.join(" ").trim();
+				const entry: EntryKind = first === "triage" ? "issue-triage" : "pr-review-comments";
+				const task = first === "triage" ? `Triage issue ${ref}${notes ? `: ${notes}` : ""}` : `Review PR ${ref}${notes ? `: ${notes}` : ""}`;
+				await startRun(ctx, task, { preApproved, pushAllowed, entry, entryRef: ref });
+				return;
+			}
 
-			const baseRefResult = await git(["rev-parse", "HEAD"], ctx.cwd);
-			const baseRef = baseRefResult.code === 0 ? baseRefResult.stdout.trim() : undefined;
-			const baselineTools = pi.getActiveTools().filter((name) => !WORKFLOW_TOOLS.includes(name));
-			const next = newState(task, baselineTools, baseRef, preApproved);
-			setState(next, ctx);
-			await enterPhase(ctx);
+			// Otherwise: [--approved] [--push] <task>
+			const { preApproved, pushAllowed, remainder: task } = parseFlags(trimmed);
+			if (!task) {
+				ctx.ui.notify(
+					"code-changes: usage: /change [--approved] [--push] <task>, or /change status|approve|revise|abort|cleanup|watch|show|triage|review|allow-push",
+					"warning",
+				);
+				return;
+			}
+			await startRun(ctx, task, { preApproved, pushAllowed });
 		},
 	});
 
@@ -480,7 +721,11 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "submit_analysis",
 		label: "Submit analysis",
-		description: "Submit the analysis report (root_cause, proposed_change, out_of_scope, repro_status, open_questions) to end the Analyze phase.",
+		description:
+			"Submit the analysis report (root_cause, proposed_change, out_of_scope, repro_status, open_questions) to end the Analyze phase. " +
+			"For the pr-review-comments entry, map the review classification onto the same fields: root_cause/proposed_change is the " +
+			"valid-comment list with its code evidence, out_of_scope is the invalid comments (named explicitly), repro_status is the " +
+			"code-path confirmation used to classify each comment, and open_questions is empty once every thread is classified.",
 		parameters: AnalysisSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!state || state.phase !== "analyze") {
@@ -489,7 +734,12 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			try {
 				const next = applyAnalysis(state, params);
 				setState(next, ctx);
-				return { content: [{ type: "text", text: `Analysis submitted. Phase is now ${PHASE_LABEL[next.phase]}.` }], details: next.analysis, terminate: true };
+				const formatted = next.analysis ? formatAnalysis(next.analysis) : "";
+				return {
+					content: [{ type: "text", text: `Analysis submitted. Phase is now ${PHASE_LABEL[next.phase]}.\n\n${formatted}` }],
+					details: next.analysis,
+					terminate: true,
+				};
 			} catch (err) {
 				if (err instanceof ArtifactError) throw new Error(err.message);
 				throw err;
@@ -550,16 +800,47 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			});
 
 			if (!state) throw new Error("run_delegation: run was aborted mid-flight.");
-			const next = transition({ ...state, runs }, "supervise");
+			let next = transition({ ...state, runs }, "supervise");
+
+			// escalate.md: a task whose implementer repeated a spec gap is escalated automatically,
+			// right after delegation -- not only on a later resume_task.
+			const escalationNotes: string[] = [];
+			for (const run of runs) {
+				if (!needsSpecGapEscalation(run)) continue;
+				try {
+					const { state: escalatedState, decision } = await escalateSpecGaps(run, next, { escalate: runResumeEscalation }, ctx, signal);
+					next = escalatedState;
+					escalationNotes.push(`- ${run.task_id}: ${decision}`);
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					escalationNotes.push(`- ${run.task_id}: escalation failed (${message})`);
+				}
+			}
+
 			setState(next, ctx);
 
 			const summary = [
 				`Delegation complete: ${runs.map((r) => `${r.task_id}=${r.status}`).join(", ")}.`,
 				mergeLog.length > 0 ? `Merge log:\n${mergeLog.map((l) => `- ${l}`).join("\n")}` : "Nothing to merge.",
-			].join("\n\n");
-			return { content: [{ type: "text", text: summary }], details: { runs, mergeLog }, terminate: true };
+				escalationNotes.length > 0 ? `Spec-gap escalation(s):\n${escalationNotes.join("\n")}` : "",
+			]
+				.filter((s) => s.length > 0)
+				.join("\n\n");
+			return { content: [{ type: "text", text: summary }], details: { runs: next.runs, mergeLog }, terminate: true };
 		},
 	});
+
+	pi.registerTool(
+		createResumeTaskTool({
+			getState: () => state,
+			commit: (nextState, ctx) => setState(nextState, ctx),
+			resolveModel: (tier, ctx) => {
+				const config = loadTierConfig(ctx.cwd);
+				return resolveTierModel(ctx.modelRegistry, config, tierForExecutor(tier), undefined).ref;
+			},
+			escalate: runResumeEscalation,
+		} satisfies ResumeDeps),
+	);
 
 	pi.registerTool({
 		name: "submit_review",
@@ -820,58 +1101,15 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
-		// A tool call may have just moved the run to "done" (submit_delivery) or "stopped"
-		// (submit_verification stop / an escalation failure). Those tools return `terminate: true`,
-		// so no further model turn runs to report the outcome — send the final message here
-		// instead, exactly once per run (enterPhase itself guards on phasePromptSent too).
-		if (state !== undefined && (state.phase === "done" || state.phase === "stopped")) {
-			if (!state.phasePromptSent) await enterPhase(ctx);
-			return;
-		}
-
+		// The approval gate (awaiting_approval) and the final done/stopped report are handled from
+		// agent_settled instead: sendMessage(..., {triggerTurn:false}) called here, while the
+		// session can still be streaming, only queues to _pendingCustomMessages and isn't rendered
+		// until the turn ends -- too late for ctx.ui.select, which would already be open by then.
+		// agent_settled fires once the session is truly idle, so the same call appends and renders
+		// immediately (see the agent_settled handler below).
+		if (state !== undefined && (state.phase === "done" || state.phase === "stopped")) return;
 		if (!isActive(state)) return;
-
-		if (state.phase === "awaiting_approval") {
-			if (state.phasePromptSent) return; // gate already asked for this awaiting period
-			state = { ...state, phasePromptSent: true };
-			persist();
-
-			const a = state.analysis;
-			const reportLines = [
-				"# Analysis ready for approval",
-				"",
-				`## Root cause\n${a?.root_cause ?? ""}`,
-				`## Proposed change\n${a?.proposed_change ?? ""}`,
-				`## Out of scope\n${a?.out_of_scope ?? ""}`,
-				`## Repro status\n${a?.repro_status ?? ""}`,
-			];
-			if (a?.open_questions.length) {
-				reportLines.push(`## Open questions\n${a.open_questions.map((q) => `- ${q}`).join("\n")}`);
-			}
-			pi.sendMessage({ customType: "code-changes-phase", content: reportLines.join("\n\n"), display: true }, { triggerTurn: false });
-
-			if (!ctx.hasUI) {
-				ctx.ui.notify("code-changes: analysis ready. Run /change approve or /change revise <feedback>.", "info");
-				return;
-			}
-
-			const choice = await ctx.ui.select("Analysis ready — what next?", ["Approve — continue to Plan", "Revise the analysis", "Stop the run"]);
-			if (!state) return;
-			if (choice === "Approve — continue to Plan") {
-				setState(transition(state, "plan"), ctx);
-				await enterPhase(ctx);
-			} else if (choice === "Revise the analysis") {
-				const feedback = await ctx.ui.editor("Revise the analysis:", "");
-				if (!state) return;
-				setState(transition(state, "analyze"), ctx);
-				await enterPhase(ctx, feedback?.trim());
-			} else if (choice === "Stop the run") {
-				const stopped = { ...state, stopReason: "stopped by user at the approval gate" };
-				setState(transition(stopped, "stopped"), ctx);
-				await enterPhase(ctx);
-			}
-			return;
-		}
+		if (state.phase === "awaiting_approval") return;
 
 		if (!state.phasePromptSent) {
 			await enterPhase(ctx);
@@ -880,6 +1118,24 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		// Phase unchanged and its prompt was already sent, but the model stopped without
 		// submitting the artifact: do nothing. The user can prompt again; the reminder will
 		// be re-injected via before_agent_start.
+	});
+
+	// Fires once the session has fully settled (idle, no automatic retry/compaction/continuation
+	// queued): the right place for the approval-gate dialog and the final done/stopped report, both
+	// of which append a display message the user must actually see before (or instead of) any
+	// further prompt -- see the comment in the agent_end handler above.
+	pi.on("agent_settled", async (_event, ctx) => {
+		if (state !== undefined && (state.phase === "done" || state.phase === "stopped")) {
+			if (!state.phasePromptSent) await enterPhase(ctx);
+			return;
+		}
+
+		if (!isActive(state)) return;
+		if (state.phase !== "awaiting_approval") return;
+		if (state.phasePromptSent) return; // gate already asked for this awaiting period
+		state = { ...state, phasePromptSent: true };
+		persist();
+		await openApprovalGate(ctx);
 	});
 
 	// Stop hooks: enforced on every settling turn, active whether or not a /change run is running.

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { cleanupWorktrees, mergedDiff, runDelegation, topoWaves } from "../extensions/code-changes/delegate.ts";
+import { cleanupWorktrees, mergedDiff, parseSpecGaps, runDelegation, topoWaves } from "../extensions/code-changes/delegate.ts";
 import { git, runShell } from "../extensions/code-changes/runner.ts";
 import type { DelegationPacket, PlanTask, TaskList } from "../extensions/code-changes/state.ts";
 
@@ -52,6 +52,22 @@ describe("topoWaves", () => {
 	it("throws on a cycle", () => {
 		const tasks = [makeTask({ id: "a", dependencies: ["b"] }), makeTask({ id: "b", dependencies: ["a"] })];
 		expect(() => topoWaves(tasks)).toThrow(/cycle/i);
+	});
+});
+
+describe("parseSpecGaps", () => {
+	it("extracts a single SPEC GAP line", () => {
+		const gaps = parseSpecGaps("Did the work.\nSPEC GAP: what should happen on empty input?\nDone.");
+		expect(gaps).toEqual(["what should happen on empty input?"]);
+	});
+
+	it("extracts every SPEC GAP line, case-insensitively and indented", () => {
+		const report = ["Report:", "  spec gap: first question", "some text", "SPEC GAP: second question"].join("\n");
+		expect(parseSpecGaps(report)).toEqual(["first question", "second question"]);
+	});
+
+	it("returns an empty array when there is no spec gap", () => {
+		expect(parseSpecGaps("All good, nothing to report.")).toEqual([]);
 	});
 });
 
@@ -115,7 +131,7 @@ async function makeTempRepo(): Promise<string> {
 function fakeWriterAgent(fileName: string, content: string) {
 	return async (opts: { cwd: string }) => {
 		await fs.promises.writeFile(path.join(opts.cwd, fileName), content, "utf-8");
-		return { exitCode: 0, text: `wrote ${fileName}`, stderr: "" };
+		return { exitCode: 0, text: `wrote ${fileName}`, stderr: "", timedOut: false };
 	};
 }
 
@@ -260,6 +276,58 @@ describe("runDelegation (integration)", () => {
 	);
 
 	it(
+		"marks a stalled implementer as failed and keeps its worktree",
+		async () => {
+			const repo = await makeTempRepo();
+			try {
+				const plan: TaskList = { tasks: [makeTask({ id: "slow-task", workspace: "worktree" })] };
+				const { runs } = await runDelegation(plan, [], {
+					cwd: repo,
+					runId: "t5",
+					resolveModel: () => undefined,
+					runAgent: async () => ({ exitCode: 124, text: "still working on it", stderr: "", timedOut: true }),
+				});
+				const run = runs.find((r) => r.task_id === "slow-task");
+				expect(run?.status).toBe("failed");
+				expect(run?.stalled).toBe(true);
+				expect(run?.error).toMatch(/stalled: exceeded \d+ min budget/);
+				expect(run?.worktree).toBeTruthy();
+				expect(fs.existsSync(run!.worktree!)).toBe(true);
+				await cleanupWorktrees(runs, repo);
+			} finally {
+				await rmrf(repo);
+			}
+		},
+		TIMEOUT,
+	);
+
+	it(
+		"records spec gaps from a successful implementer report without failing the run",
+		async () => {
+			const repo = await makeTempRepo();
+			try {
+				const plan: TaskList = { tasks: [makeTask({ id: "gappy-task", workspace: "worktree" })] };
+				const { runs } = await runDelegation(plan, [], {
+					cwd: repo,
+					runId: "t6",
+					resolveModel: () => undefined,
+					runAgent: async (opts) => {
+						await fs.promises.writeFile(path.join(opts.cwd, "gap.txt"), "content\n", "utf-8");
+						return { exitCode: 0, text: "SPEC GAP: should this handle nulls?\nDone otherwise.", stderr: "", timedOut: false };
+					},
+				});
+				const run = runs.find((r) => r.task_id === "gappy-task");
+				expect(run?.status).toBe("succeeded");
+				expect(run?.spec_gaps).toEqual(["should this handle nulls?"]);
+				await cleanupWorktrees(runs, repo);
+			} finally {
+				await rmrf(repo);
+			}
+		},
+		TIMEOUT,
+	);
+
+	it(
 		"marks a coordinator-direct task without spawning an agent",
 		async () => {
 			const repo = await makeTempRepo();
@@ -274,7 +342,7 @@ describe("runDelegation (integration)", () => {
 					resolveModel: () => undefined,
 					runAgent: async () => {
 						called = true;
-						return { exitCode: 0, text: "", stderr: "" };
+						return { exitCode: 0, text: "", stderr: "", timedOut: false };
 					},
 				});
 				expect(runs[0].status).toBe("coordinator");

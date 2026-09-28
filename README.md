@@ -42,15 +42,36 @@ pi -e ./extensions/code-changes/index.ts
 ## Usage
 
 ```
-/change <task>              start a run (Analyze first)
-/change --approved <task>   start a run that skips the approval gate if Analyze has no open questions
-/change status               show the active run's phase and failure count
-/change approve               approve the analysis, continue to Plan
-/change revise <feedback>     send the analysis back to Analyze with feedback
-/change abort                  stop the run and clean up worktrees
-/change cleanup                 remove any leftover worktrees for the active run
-/change watch [pr]              watch a PR's checks (explicit; also restarts a stalled/timed-out watch)
+/change <task>                 start a run (Analyze first)
+/change triage <issue>          start a run at the issue-triage entry — bare "look at/triage issue
+                                 #n"; the analysis itself can be the deliverable, ended at the gate
+/change review <pr>             start a run at the pr-review-comments entry — "handle the review
+                                 comments on PR #n"
+/change <task> --approved       skip the approval gate if Analyze has no open questions
+/change <task> --push           allow push, PR creation, and PR/issue replies for this run
+                                 (--approved and --push combine, and go before the task/issue/pr)
+/change allow-push               allow push/PR/replies mid-run, without restarting it
+/change status                   show the active run's phase and failure count
+/change show                     re-print the current analysis/plan/review
+/change approve                  approve the analysis, continue to Plan
+/change revise <feedback>        send the analysis back to Analyze with feedback
+/change abort                    stop the run and clean up worktrees
+/change cleanup                  remove any leftover worktrees for the active run
+/change watch [pr]               watch a PR's checks (explicit; also restarts a stalled/timed-out watch)
 ```
+
+At the Analyze approval gate, the human picks one of: **Approve**; **Approve and allow push/PR**
+(same as approve, plus `/change allow-push`); **Edit the analysis myself** (opens an editor
+pre-filled with the analysis — the edits become the approved artifact, recorded as
+`analysisEditedByHuman`); **Send feedback to revise** (same as `/change revise`); **Done — triage
+only** (issue-triage entry only: end the run here with the analysis as the deliverable, no
+implementation); or **Stop**.
+
+Supervise can hand a stuck implementer a decision without restarting it: `resume_task` (params
+`task_id`, `answer`) resumes that task in its own workspace. Implementers report a blocking
+ambiguity with a `SPEC GAP:` line; a task also has a per-task time budget — an implementer that
+exceeds it is killed and marked stalled. A second `SPEC GAP:` on the same task, or a second stall,
+escalates automatically instead of asking Supervise to keep deciding.
 
 ## What is enforced
 
@@ -67,6 +88,40 @@ pi -e ./extensions/code-changes/index.ts
 | Delivery uses conventional commits | commit subjects collected from `git log <baseRef>..HEAD` and validated against the conventional-commit grammar |
 | A PR's checks are watched before a run completes | Deliver routes to a "ci" phase instead of "done" when a PR is known; the harness polls `gh pr checks` and only transitions the run once they resolve |
 | State survives resume/fork | `pi.appendEntry(STATE_ENTRY, state)` on every transition, restored on `session_start` |
+| Push, PR creation, and PR/issue replies are blocked unless allowed | `WorkflowState.pushAllowed` (set by `--push` at start or `/change allow-push` mid-run), enforced in `gates.ts`/`delivery` |
+| Staging must be explicit | `git add -A` / `git add .` / `git commit -a` are rejected by `isReadOnlyCommand`'s sibling staging check in `gates.ts` |
+| A repeated implementer spec gap escalates automatically | `TaskRun.spec_gaps` count tracked in `state.ts`/`delegate.ts`; a second `SPEC GAP:` on the same task triggers `escalate.ts` without waiting for Supervise to ask |
+| A stalled implementer is killed and surfaced, not left hanging | per-task time budget enforced in `delegate.ts`; `TaskRun.stalled` flips true and Supervise is prompted to `resume_task` |
+
+## Skill and harness
+
+`skills/code-changes/` stays the standalone source of truth: read on its own — by Claude Code,
+GitHub Copilot, or any other agent that doesn't load this pi extension — it describes the full
+workflow in Markdown and works unmodified.
+
+Sections of that Markdown describe flow this harness now enforces in code, which would otherwise
+duplicate (or drift from) the code, or actively contradict a model that's being told by both. Those
+sections are wrapped in `<!-- harness:enforced -->` … `<!-- /harness:enforced -->` markers, on their
+own lines. A standalone Markdown reader ignores HTML comments, so the guidance still reads
+normally; `readReference`/`stripEnforced` in `extensions/code-changes/prompts.ts` strip the marked
+blocks before a reference file is injected into a phase prompt (`readReference(name, { harness:
+false })` opts back into the raw file — used only by the guard test that checks the source file
+itself still has its standalone content).
+
+The markers must wrap only rules the code enforces — never judgment or craft guidance a model still
+has to apply. What's wrapped, per file, and what enforces it:
+
+| Reference file | Wrapped | Enforced by |
+|---|---|---|
+| `analyze.md` | "Output of this phase" (the schema is a tool now), "Stop gate" | `AnalysisSchema` in `artifacts.ts`; the `agent_end` approval gate in `index.ts` |
+| `plan.md` | "Output of this phase"; the `merge_plan`-required and once-on-merged-state parts of "Plan the merge" | `PlanSchema`/`validatePlan` in `artifacts.ts` |
+| `delegate.md` | Everything except the executor-tier bullets (which tier fits which task, "delegate anyway when there's real parallelism") | Tier choice is still a Plan-time judgment call; the rest (what a delegation carries, what's never delegated downward) is standing instructions the harness already sends (`STANDING_INSTRUCTIONS` in `artifacts.ts`) or enforces via `PHASE_TOOLS` |
+| `supervise.md` | "Integrate before reviewing" | `delegate.ts`'s squash-merge per `merge_plan`; only an actual conflict is left for the model to resolve |
+| `verify.md` | "Retry cap"; the routing half of "On failure" (the → destination, not the gate-failure/spec-mismatch/wrong-root-cause definitions, which the model still classifies) | `state.failures`/`applyVerification` in `artifacts.ts` |
+| `escalate.md` | The "Verify sent the same task back twice" and "repeated spec gap" trigger bullets | Both fire automatically from `state.failures` / `TaskRun.spec_gaps` instead of the model tracking a count in prose |
+| `deliver.md` | The conventional-commit-format bullet | `CONVENTIONAL_COMMIT`/`validateCommitSubjects` in `artifacts.ts` |
+| `artifacts.md` | Everything except a short "Why this matters" | The field lists are TypeBox tool schemas now (`artifacts.ts`); the file is no longer injected into any phase prompt at all |
+| `SKILL.md` | Not injected (never read by this extension) | One added, unwrapped note tells a human/agent running under the harness not to re-run the skill's own flow manually |
 
 ## Stop hooks
 

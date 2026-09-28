@@ -7,7 +7,7 @@
  */
 
 import { Type, type Static } from "typebox";
-import { transition, type WorkflowState, type PlanTask, type TaskList, type FailureRecord, type PullRequestRef } from "./state.ts";
+import { transition, type WorkflowState, type PlanTask, type TaskList, type FailureRecord, type PullRequestRef, type AnalysisReport } from "./state.ts";
 import type { GateResult } from "./state.ts";
 
 // ---------------------------------------------------------------------------
@@ -98,6 +98,106 @@ export class ArtifactError extends Error {
 		super(message);
 		this.name = "ArtifactError";
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 3a. Analysis <-> Markdown (approval-gate display + human editing round trip)
+// ---------------------------------------------------------------------------
+
+const ANALYSIS_SECTION_HEADINGS: Record<keyof Omit<AnalysisReport, "open_questions">, string> = {
+	root_cause: "Root cause",
+	proposed_change: "Proposed change",
+	out_of_scope: "Out of scope",
+	repro_status: "Repro status",
+};
+
+const REQUIRED_ANALYSIS_SECTIONS: Array<{ key: keyof AnalysisReport; heading: string }> = [
+	{ key: "root_cause", heading: "Root cause" },
+	{ key: "proposed_change", heading: "Proposed change" },
+	{ key: "repro_status", heading: "Repro status" },
+];
+
+/**
+ * Renders an analysis report as Markdown for the approval-gate transcript message and for the
+ * human-editing flow (`ctx.ui.editor`). Open questions come first, when any are unresolved, so
+ * they aren't missed below the other sections. `parseAnalysisMarkdown` is the inverse.
+ */
+export function formatAnalysis(a: AnalysisReport, opts?: { edited?: boolean }): string {
+	const lines: string[] = [];
+	lines.push("# Analysis");
+	if (opts?.edited) lines.push("_(edited by you)_");
+	if (a.open_questions.length > 0) {
+		lines.push("");
+		lines.push("## Open questions");
+		for (const q of a.open_questions) lines.push(`- ${q}`);
+	}
+	lines.push("");
+	lines.push(`## ${ANALYSIS_SECTION_HEADINGS.root_cause}\n${a.root_cause}`);
+	lines.push("");
+	lines.push(`## ${ANALYSIS_SECTION_HEADINGS.proposed_change}\n${a.proposed_change}`);
+	lines.push("");
+	lines.push(`## ${ANALYSIS_SECTION_HEADINGS.out_of_scope}\n${a.out_of_scope}`);
+	lines.push("");
+	lines.push(`## ${ANALYSIS_SECTION_HEADINGS.repro_status}\n${a.repro_status}`);
+	return lines.join("\n");
+}
+
+/**
+ * Parses `formatAnalysis`'s Markdown back into an `AnalysisReport`. Tolerant of the human deleting
+ * or reordering sections (matched by heading text, not position) and of extra prose outside any
+ * `## ` section. `open_questions` are `- ` bullets under "Open questions"; missing entirely means
+ * none. Throws `ArtifactError` naming any missing required section (root cause, proposed change,
+ * repro status — the same fields `applyAnalysis` requires).
+ */
+export function parseAnalysisMarkdown(md: string): AnalysisReport {
+	const lines = md.replace(/\r\n/g, "\n").split("\n");
+	const sections = new Map<string, string[]>();
+	let current: string | undefined;
+	for (const line of lines) {
+		const heading = line.match(/^##\s+(.+?)\s*$/);
+		if (heading) {
+			current = heading[1].trim().toLowerCase();
+			if (!sections.has(current)) sections.set(current, []);
+			continue;
+		}
+		if (/^#\s+/.test(line)) {
+			current = undefined; // top-level title (or a stray "# ..."): not a section body
+			continue;
+		}
+		if (current) sections.get(current)!.push(line);
+	}
+
+	const sectionText = (heading: string): string => {
+		const body = sections.get(heading.toLowerCase());
+		if (!body) return "";
+		return body.join("\n").trim();
+	};
+
+	const values: Partial<Record<keyof AnalysisReport, string>> = {};
+	const missing: string[] = [];
+	for (const { key, heading } of REQUIRED_ANALYSIS_SECTIONS) {
+		const text = sectionText(heading);
+		values[key] = text;
+		if (!text) missing.push(heading);
+	}
+	if (missing.length > 0) {
+		throw new ArtifactError(`Edited analysis is missing required section(s): ${missing.join(", ")}.`);
+	}
+
+	const openQuestionsBody = sections.get("open questions") ?? [];
+	const open_questions = openQuestionsBody
+		.map((l) => l.trim())
+		.filter((l) => l.startsWith("- "))
+		.map((l) => l.slice(2).trim())
+		.filter((l) => l.length > 0);
+
+	return {
+		root_cause: values.root_cause ?? "",
+		proposed_change: values.proposed_change ?? "",
+		out_of_scope: sectionText(ANALYSIS_SECTION_HEADINGS.out_of_scope),
+		repro_status: values.repro_status ?? "",
+		open_questions,
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +353,8 @@ export function applyPlan(state: WorkflowState, plan: PlanParams): WorkflowState
 // ---------------------------------------------------------------------------
 
 export const STANDING_INSTRUCTIONS =
-	"Report what changed and what was verified. Stop and report on any spec gap instead of improvising scope. " +
+	"Report what changed and what was verified. When the spec doesn't cover something, write a line starting with " +
+	'"SPEC GAP: <question>" and stop instead of improvising scope. ' +
 	"Do not commit; the coordinator merges. Run the verification commands before reporting done.";
 
 export function buildPackets(plan: TaskList) {

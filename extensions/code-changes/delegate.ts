@@ -56,6 +56,27 @@ async function writePromptToTempFile(name: string, prompt: string): Promise<{ di
 
 const DEFAULT_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
+/** Default per-task time budget before a stalled implementer is killed (supervise.md). */
+export const DEFAULT_TASK_TIMEOUT_MS = 20 * 60_000;
+
+/** Best-effort kill of a process (and its children on Windows, via taskkill /T). */
+function killProcessTree(pid: number | undefined): void {
+	if (pid === undefined) return;
+	if (process.platform === "win32") {
+		try {
+			spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
+		} catch {
+			/* ignore */
+		}
+		return;
+	}
+	try {
+		process.kill(pid, "SIGKILL");
+	} catch {
+		/* ignore */
+	}
+}
+
 export interface RunPiAgentOptions {
 	cwd: string;
 	model?: string;
@@ -63,6 +84,8 @@ export interface RunPiAgentOptions {
 	task: string;
 	signal?: AbortSignal;
 	tools?: string[];
+	/** Kills the sub-agent process tree once exceeded. Defaults to `DEFAULT_TASK_TIMEOUT_MS`. */
+	timeoutMs?: number;
 }
 
 export interface RunPiAgentUsage {
@@ -80,13 +103,17 @@ export interface RunPiAgentResult {
 	text: string;
 	stderr: string;
 	usage?: RunPiAgentUsage;
+	/** True when the process was killed for exceeding `timeoutMs`. */
+	timedOut: boolean;
 }
 
 /**
  * Spawns a fresh, session-less `pi` subprocess in JSON mode to execute one delegated task, and
  * collects its final assistant text. `--no-extensions` keeps the child from loading this very
  * extension (or any project extension that might otherwise interfere with a scoped implementer
- * run).
+ * run). A child `pi -p` process can't be talked to mid-run, so a stalled or looping implementer is
+ * handled by killing it once it exceeds its time budget (`timeoutMs`) — the coordinator then
+ * decides whether to resume it (see `resume.ts`).
  */
 export async function runPiAgent(opts: RunPiAgentOptions): Promise<RunPiAgentResult> {
 	const args: string[] = ["--mode", "json", "-p", "--no-session", "--no-extensions"];
@@ -99,6 +126,7 @@ export async function runPiAgent(opts: RunPiAgentOptions): Promise<RunPiAgentRes
 	const usage: RunPiAgentUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
 	let lastAssistantText = "";
 	let stderr = "";
+	let timedOut = false;
 
 	try {
 		const promptFile = await writePromptToTempFile("implementer", opts.systemPrompt);
@@ -106,6 +134,8 @@ export async function runPiAgent(opts: RunPiAgentOptions): Promise<RunPiAgentRes
 		tmpFile = promptFile.filePath;
 		args.push("--append-system-prompt", tmpFile);
 		args.push(`Task: ${opts.task}`);
+
+		const timeoutMs = opts.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
@@ -144,6 +174,11 @@ export async function runPiAgent(opts: RunPiAgentOptions): Promise<RunPiAgentRes
 				}
 			};
 
+			const timeoutHandle = setTimeout(() => {
+				timedOut = true;
+				killProcessTree(proc.pid);
+			}, timeoutMs);
+
 			proc.stdout.on("data", (data) => {
 				buffer += data.toString();
 				const lines = buffer.split("\n");
@@ -154,10 +189,12 @@ export async function runPiAgent(opts: RunPiAgentOptions): Promise<RunPiAgentRes
 				stderr += data.toString();
 			});
 			proc.on("close", (code) => {
+				clearTimeout(timeoutHandle);
 				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
+				resolve(timedOut ? 124 : code ?? 0);
 			});
 			proc.on("error", (err) => {
+				clearTimeout(timeoutHandle);
 				stderr += `\nSpawn error: ${err instanceof Error ? err.message : String(err)}`;
 				resolve(127);
 			});
@@ -174,7 +211,7 @@ export async function runPiAgent(opts: RunPiAgentOptions): Promise<RunPiAgentRes
 			}
 		});
 
-		return { exitCode, text: lastAssistantText, stderr, usage };
+		return { exitCode, text: lastAssistantText, stderr, usage, timedOut };
 	} finally {
 		if (tmpFile) {
 			try {
@@ -230,15 +267,47 @@ export interface DelegateDeps {
 	onProgress?(runs: TaskRun[]): void;
 	/** Injectable for tests. Defaults to `runPiAgent`. */
 	runAgent?: typeof runPiAgent;
+	/** Per-task time budget passed to `runPiAgent`. Defaults to `DEFAULT_TASK_TIMEOUT_MS`. */
+	taskTimeoutMs?: number;
 }
 
-const IMPLEMENTER_SYSTEM_PROMPT = [
+export const IMPLEMENTER_SYSTEM_PROMPT = [
 	"You are an implementer executing one pinned task from a larger plan.",
 	"Stay strictly in scope: implement only what the task spec below describes, and do not touch files or behavior outside it.",
 	"Run the verification commands listed in the task before you report done.",
-	"If you hit something the spec does not cover, stop and report the gap instead of improvising scope.",
+	"If the spec does not cover something, stop and write a line starting with `SPEC GAP:` describing the question; do not improvise scope.",
 	"End your final message with a report: what changed, what you verified (and the result), and any spec gap you found.",
 ].join(" ");
+
+/** Matches every `SPEC GAP: ...` line an implementer's report wrote (delegate.md / supervise.md). */
+export function parseSpecGaps(report: string): string[] {
+	const gaps: string[] = [];
+	const regex = /^\s*SPEC GAP:\s*(.+)$/gim;
+	let match: RegExpExecArray | null;
+	while ((match = regex.exec(report)) !== null) {
+		gaps.push(match[1].trim());
+	}
+	return gaps;
+}
+
+/**
+ * Stages and commits everything in `worktree`. Returns `{ committed: false }` (no throw) when
+ * there is nothing to commit or the commit itself fails, so callers can fold that into their own
+ * run status/error handling.
+ */
+export async function commitWorktree(worktree: string, taskId: string, message?: string): Promise<{ committed: boolean; head?: string }> {
+	await git(["add", "-A"], worktree);
+	const statusResult = await git(["status", "--porcelain"], worktree);
+	if (statusResult.stdout.trim() === "") {
+		return { committed: false };
+	}
+	const commitResult = await git(["commit", "-m", message ?? `wip(${taskId}): implementer output`, "--no-verify"], worktree);
+	if (commitResult.code !== 0) {
+		return { committed: false };
+	}
+	const headResult = await git(["rev-parse", "HEAD"], worktree);
+	return { committed: true, head: headResult.code === 0 ? headResult.stdout.trim() : undefined };
+}
 
 function buildTaskPrompt(spec: string, verificationCommands: string[], standingInstructions: string): string {
 	const verificationBlock =
@@ -306,15 +375,26 @@ async function runWorktreeTask(
 
 	const model = deps.resolveModel(task.executor_tier);
 	const runAgent = deps.runAgent ?? runPiAgent;
+	const timeoutMs = deps.taskTimeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
 	const result = await runAgent({
 		cwd: worktreePath,
 		model,
 		systemPrompt: IMPLEMENTER_SYSTEM_PROMPT,
 		task: taskPacketPrompt(task, packet),
 		signal: deps.signal,
+		timeoutMs,
 	});
 	run.model = model;
 	run.report = result.text;
+	run.spec_gaps = [...(run.spec_gaps ?? []), ...parseSpecGaps(result.text)];
+	run.stalled = result.timedOut;
+
+	if (result.timedOut) {
+		run.status = "failed";
+		run.error = `stalled: exceeded ${Math.round(timeoutMs / 60_000)} min budget`;
+		notify();
+		return;
+	}
 
 	if (result.exitCode !== 0) {
 		run.status = "failed";
@@ -323,19 +403,10 @@ async function runWorktreeTask(
 		return;
 	}
 
-	await git(["add", "-A"], worktreePath, deps.signal);
-	const statusResult = await git(["status", "--porcelain"], worktreePath, deps.signal);
-	if (statusResult.stdout.trim() === "") {
+	const commit = await commitWorktree(worktreePath, task.id);
+	if (!commit.committed) {
 		run.status = "failed";
 		run.error = "implementer made no changes";
-		notify();
-		return;
-	}
-
-	const commitResult = await git(["commit", "-m", `wip(${task.id}): implementer output`, "--no-verify"], worktreePath, deps.signal);
-	if (commitResult.code !== 0) {
-		run.status = "failed";
-		run.error = `git commit failed: ${tail(commitResult.stderr || commitResult.stdout)}`;
 		notify();
 		return;
 	}
@@ -356,17 +427,24 @@ async function runMainTask(
 
 	const model = deps.resolveModel(task.executor_tier);
 	const runAgent = deps.runAgent ?? runPiAgent;
+	const timeoutMs = deps.taskTimeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
 	const result = await runAgent({
 		cwd: deps.cwd,
 		model,
 		systemPrompt: IMPLEMENTER_SYSTEM_PROMPT,
 		task: taskPacketPrompt(task, packet),
 		signal: deps.signal,
+		timeoutMs,
 	});
 	run.model = model;
 	run.report = result.text;
+	run.spec_gaps = [...(run.spec_gaps ?? []), ...parseSpecGaps(result.text)];
+	run.stalled = result.timedOut;
 
-	if (result.exitCode !== 0) {
+	if (result.timedOut) {
+		run.status = "failed";
+		run.error = `stalled: exceeded ${Math.round(timeoutMs / 60_000)} min budget`;
+	} else if (result.exitCode !== 0) {
 		run.status = "failed";
 		run.error = tail(result.stderr) || `implementer exited with code ${result.exitCode}`;
 	} else {
