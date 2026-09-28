@@ -1,5 +1,5 @@
 {
-  "name": "@jandedobbeleer/pi-code-changes",
+  "name": "@jandedobbeleer/pi-graph",
   "version": "0.1.0",
   "description": "The code-changes workflow (analyze, plan, delegate, supervise, verify, deliver) as a pi extension with phases enforced by code.",
   "type": "module",

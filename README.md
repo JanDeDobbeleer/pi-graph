@@ -1,4 +1,4 @@
-# pi-code-changes
+# pi-graph
 
 The `code-changes` skill — analyze, plan, delegate, supervise, verify, deliver — packaged as a
 [pi](https://pi.dev/) extension. The skill stays the source of truth for what each phase does; this
@@ -30,10 +30,10 @@ side-call, not a new owner — the answer folds back into the phase that asked.
 
 ```
 # personal use, every repo
-pi install git:github.com/jandedobbeleer/pi-code-changes@v1
+pi install git:github.com/JanDeDobbeleer/pi-graph@v1
 
 # project-local, committed to .pi/settings.json
-pi install -l git:github.com/jandedobbeleer/pi-code-changes@v1
+pi install -l git:github.com/JanDeDobbeleer/pi-graph@v1
 
 # development, from inside this repo
 pi -e ./extensions/code-changes/index.ts

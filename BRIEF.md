@@ -1,4 +1,4 @@
-# Brief: pi-code-changes
+# Brief: pi-graph
 
 Handoff for a new session. Read this fully before touching code.
 
@@ -95,7 +95,7 @@ The mapping above was written from the docs, not from running code. Open questio
 ## Target repository layout
 
 ```
-pi-code-changes/
+pi-graph/
 ├── package.json                  pi package manifest
 ├── extensions/
 │   └── code-changes/
@@ -115,7 +115,7 @@ pi-code-changes/
 
 ```json
 {
-  "name": "@jandedobbeleer/pi-code-changes",
+  "name": "@jandedobbeleer/pi-graph",
   "version": "0.1.0",
   "keywords": ["pi-package"],
   "pi": {
@@ -142,8 +142,8 @@ pi loads extensions from:
 Plan for this package:
 
 - During development: `pi -e ./extensions/code-changes/index.ts` from inside a test repo.
-- Personal use in every repo: `pi install git:github.com/jandedobbeleer/pi-code-changes@v1`
-- oh-my-posh contributors: from the oh-my-posh repo run `pi install -l git:github.com/jandedobbeleer/pi-code-changes@v1`,
+- Personal use in every repo: `pi install git:github.com/JanDeDobbeleer/pi-graph@v1`
+- oh-my-posh contributors: from the oh-my-posh repo run `pi install -l git:github.com/JanDeDobbeleer/pi-graph@v1`,
   which pins it in `.pi/settings.json` (commit that file, not a copy of the code).
 - Optional later: publish to npm so the `pi-package` keyword lists it in the pi gallery.
 
