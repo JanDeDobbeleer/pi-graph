@@ -33,6 +33,9 @@ describe("isReadOnlyCommand", () => {
 		"git fetch origin",
 		"git ls-remote origin",
 		"irm https://x",
+		"cd src && grep -ri foo .",
+		"pushd src && ls",
+		"Set-Location src",
 	])("accepts %s", (command) => {
 		expect(isReadOnlyCommand(command)).toBe(true);
 	});
@@ -59,6 +62,7 @@ describe("isReadOnlyCommand", () => {
 		"curl -X DELETE https://x",
 		"iwr https://x -OutFile f",
 		"git fetch && git reset --hard",
+		"cd src && rm x",
 	])("rejects %s", (command) => {
 		expect(isReadOnlyCommand(command)).toBe(false);
 	});
@@ -83,6 +87,22 @@ describe("decideToolCall", () => {
 		for (const tool of ["edit", "write", "bash", "powershell", "submit_plan", "submit_analysis", "escalate"]) {
 			expect(decideToolCall(state, tool, {})?.block).toBe(true);
 		}
+	});
+
+	it("blocks every tool in awaiting_plan_approval except read/grep/find/ls", () => {
+		const state = stateInPhase("awaiting_plan_approval");
+		for (const tool of ["read", "grep", "find", "ls"]) {
+			expect(decideToolCall(state, tool, {})).toBeUndefined();
+		}
+		for (const tool of ["edit", "write", "bash", "powershell", "submit_plan", "run_delegation", "escalate"]) {
+			expect(decideToolCall(state, tool, {})?.block).toBe(true);
+		}
+	});
+
+	it("names /change approve as the way out of awaiting_plan_approval", () => {
+		const decision = decideToolCall(stateInPhase("awaiting_plan_approval"), "bash", { command: "git status" });
+		expect(decision?.block).toBe(true);
+		expect(decision?.reason).toContain("/change approve");
 	});
 
 	it("blocks submit_plan in analyze", () => {

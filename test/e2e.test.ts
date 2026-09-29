@@ -21,6 +21,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import codeChanges from "../extensions/code-changes/index.ts";
+import { resetRetrySleep, setRetrySleep } from "../extensions/code-changes/retry.ts";
 import { git } from "../extensions/code-changes/runner.ts";
 
 const TIMEOUT = 120_000;
@@ -60,7 +61,10 @@ afterEach(async () => {
 // for "the model reacted to what it was just told".
 // ---------------------------------------------------------------------------
 
-type ScriptStep = { tool: string; args: Record<string, unknown>; before?: () => void } | { text: string; before?: () => void };
+type ScriptStep =
+	| { tool: string; args: Record<string, unknown>; before?: () => void }
+	| { text: string; before?: () => void }
+	| { error: string; before?: () => void };
 
 function usage() {
 	return { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
@@ -101,6 +105,15 @@ function scriptedStream(model: Model<Api>, step: ScriptStep | undefined, onIdle?
 			stream.push({ type: "text_end", contentIndex: idx, content: text, partial: output });
 			output.stopReason = "stop";
 			stream.push({ type: "done", reason: "stop", message: output });
+			stream.end();
+			return;
+		}
+
+		if ("error" in step) {
+			const errorMessage = assistantStub(model);
+			errorMessage.stopReason = "error";
+			errorMessage.errorMessage = step.error;
+			stream.push({ type: "error", reason: "error", error: errorMessage });
 			stream.end();
 			return;
 		}
@@ -277,6 +290,17 @@ describe("code-changes e2e (real pi runtime, scripted fake model)", () => {
 						],
 					},
 				});
+				await session.prompt("/change approve");
+				await session.waitForIdle();
+
+				// --- awaiting_plan_approval: no UI in this session, so the run parks after submit_plan;
+				// the plan must already be a real "code-changes-plan" custom message in the session, and
+				// /change approve continues it to Delegate. ---
+				const planEntry = session.sessionManager
+					.getBranch()
+					.find((e: any) => e.type === "custom_message" && e.customType === "code-changes-plan");
+				expect(planEntry).toBeDefined();
+
 				queue.push({ tool: "run_delegation", args: {} });
 				// Supervise: make the real edit, then submit the review.
 				queue.push({ tool: "write", args: { path: "greeting.txt", content: "Hi\n" } });
@@ -419,6 +443,58 @@ describe("code-changes e2e (real pi runtime, scripted fake model)", () => {
 				expect(fs.existsSync(path.join(repo, "MARKER"))).toBe(true);
 			} finally {
 				session.dispose();
+			}
+		},
+		TIMEOUT,
+	);
+
+	it(
+		"retries a transient provider error pi's own retry doesn't cover, then continues the run",
+		async () => {
+			const repo = await makeTempRepo();
+			cleanupDirs.push(repo);
+			const { extension: fakeProvider, model, queue } = makeFakeProvider();
+			const session = await makeSession(repo, [fakeProvider], model);
+			setRetrySleep(async () => undefined); // no real waiting in tests
+
+			try {
+				// First turn errors with a transient status pi-ai's own RETRYABLE_PROVIDER_ERROR_PATTERN
+				// doesn't cover (no 499); the harness's own agent_before_settle retry must catch it and
+				// let the run continue to a normal tool call afterwards.
+				queue.push({ error: "499 status code (no body)" });
+				queue.push({
+					tool: "submit_analysis",
+					args: {
+						root_cause: "greeting.txt says Hello instead of Hi",
+						proposed_change: "change the greeting text to Hi",
+						out_of_scope: "nothing else",
+						repro_status: "reproduced: read greeting.txt",
+						open_questions: [],
+					},
+				});
+
+				await session.prompt("/change fix the greeting");
+				await session.waitForIdle();
+
+				if (process.env.E2E_DEBUG) {
+					console.log(JSON.stringify(session.messages.map((m: any) => ({ role: m.role, customType: m.customType, toolName: m.toolName, isError: m.isError, content: m.content })), null, 2));
+				}
+
+				// The run continued past the transient error: submit_analysis still ran.
+				const analysisEntry = session.sessionManager
+					.getBranch()
+					.find((e: any) => e.type === "custom_message" && e.customType === "code-changes-analysis");
+				expect(analysisEntry).toBeDefined();
+
+				// transientRetries was incremented (and persisted) for the retry, before the phase
+				// transition on submit_analysis reset it back to 0.
+				const stateEntries = session.sessionManager
+					.getBranch()
+					.filter((e: any) => e.type === "custom" && e.customType === "code-changes-state");
+				expect(stateEntries.some((e: any) => (e.data as { transientRetries?: number })?.transientRetries === 1)).toBe(true);
+			} finally {
+				session.dispose();
+				resetRetrySleep();
 			}
 		},
 		TIMEOUT,

@@ -54,7 +54,7 @@ coordinator is equipped to make itself.
 1. **Analyze** ([references/analyze.md](references/analyze.md)) — root cause and scope, validated against the code,
    never against the report alone.
 2. **Plan** ([references/plan.md](references/plan.md)) — pinned spec, task split, parallel vs sequential, workspace per
-   task.
+   task. Ends with its own stop gate: report the plan and wait for a go before delegating.
 3. **Delegate** ([references/delegate.md](references/delegate.md)) — match each task to the right executor,
    coordinator-tier by default.
 4. **Supervise** ([references/supervise.md](references/supervise.md)) — monitor, unblock, and critically review
@@ -67,9 +67,11 @@ Analyze, Supervise, and Verify each carry an escalation checkpoint — see
 [references/escalate.md](references/escalate.md) — for handing one specific judgment call to the strongest available
 model without giving up ownership of the phase.
 
-**Stop gate:** Phase 1 ends with reporting the analysis and proposed approach to the user and waiting for a go. Skip the
-gate only when the user already gave the go in the request itself ("do it", "fix it and commit", "implement with
-Sonnet").
+**Stop gates:** there are two. Phase 1 ends with reporting the analysis and proposed approach to the user and waiting
+for a go; Phase 2 ends with reporting the plan — task list, executor tiers, workspaces, dependencies, verification
+commands, and merge plan — and waiting for a go before delegating. Skip either gate only when the user already gave
+the go in the request itself ("do it", "fix it and commit", "implement with Sonnet"); a go for one is not a go for the
+other.
 
 ## Special cases
 

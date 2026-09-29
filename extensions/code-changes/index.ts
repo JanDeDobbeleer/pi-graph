@@ -36,7 +36,10 @@ import {
 	applyVerification,
 	buildPackets,
 	formatAnalysis,
+	formatPlan,
 	parseAnalysisMarkdown,
+	parseEditablePlan,
+	planToEditable,
 	requiredGateCommands,
 	resolveEscalatedFailure,
 	validateCommitSubjects,
@@ -49,6 +52,7 @@ import { discoverStopHooks, findRepoRoot, formatHookFeedback, hooksBlocked, runS
 import { loadReadOnlyTools, loadTierConfig, modelRef, resolveTierModel, tierForExecutor } from "./models.ts";
 import { phasePrompt, phaseReminder } from "./prompts.ts";
 import { createResumeTaskTool, escalateSpecGaps, needsSpecGapEscalation, type ResumeDeps } from "./resume.ts";
+import { isTransientProviderError, MAX_TRANSIENT_RETRIES, retryBackoff } from "./retry.ts";
 import { git, runShell } from "./runner.ts";
 import {
 	newState,
@@ -63,6 +67,7 @@ import {
 	type GateResult,
 	type Phase,
 	type PullRequestRef,
+	type TaskList,
 	type TaskRun,
 	type WorkflowState,
 } from "./state.ts";
@@ -104,6 +109,13 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	// -------------------------------------------------------------------------
 
 	pi.registerMessageRenderer<AnalysisReport>("code-changes-analysis", (message) => {
+		const text = typeof message.content === "string"
+			? message.content
+			: message.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
+		return new Markdown(text, 1, 0, getMarkdownTheme());
+	});
+
+	pi.registerMessageRenderer<TaskList>("code-changes-plan", (message) => {
 		const text = typeof message.content === "string"
 			? message.content
 			: message.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
@@ -530,10 +542,91 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	}
 
 	// -------------------------------------------------------------------------
+	// Plan approval gate: mirrors the approval gate above (same agent_settled entry, same
+	// /change approve|revise|show wiring in index.ts's command handler).
+	// -------------------------------------------------------------------------
+
+	function sendPlanMessage(current: WorkflowState): void {
+		if (!current.plan) return;
+		pi.sendMessage(
+			{
+				customType: "code-changes-plan",
+				content: formatPlan(current.plan, { edited: current.planEditedByHuman }),
+				display: true,
+				details: current.plan,
+			},
+			{ triggerTurn: false },
+		);
+	}
+
+	const NO_UI_PLAN_GATE_HINT = "code-changes: plan ready. Run /change approve, /change show or /change revise <feedback>.";
+
+	async function openPlanApprovalGate(ctx: ExtensionContext, opts?: { resend?: boolean }): Promise<void> {
+		if (!state || state.phase !== "awaiting_plan_approval") return;
+		if ((opts?.resend ?? true) && state.plan) sendPlanMessage(state);
+
+		if (!ctx.hasUI) {
+			ctx.ui.notify(NO_UI_PLAN_GATE_HINT, "info");
+			return;
+		}
+
+		const options = ["Approve — start delegation", "Edit the plan myself", "Send feedback to revise", "Stop the run"];
+		const choice = await ctx.ui.select("Review the plan above", options);
+		if (!state || state.phase !== "awaiting_plan_approval") return; // state moved on while the dialog was open
+
+		if (choice === undefined) {
+			ctx.ui.notify(`code-changes: run /change approve, /change show or /change revise <feedback>.`, "info");
+			return; // cancelled: leave the run awaiting
+		}
+
+		if (choice === "Approve — start delegation") {
+			setState(transition(state, "delegate"), ctx);
+			await enterPhase(ctx);
+			return;
+		}
+
+		if (choice === "Edit the plan myself") {
+			const prefill = planToEditable(state.plan!);
+			const edited = await ctx.ui.editor("Edit the plan", prefill);
+			if (!state || state.phase !== "awaiting_plan_approval") return;
+			if (!edited?.trim()) {
+				await openPlanApprovalGate(ctx, { resend: false });
+				return;
+			}
+			try {
+				const parsed = parseEditablePlan(edited);
+				const next = { ...state, plan: parsed, packets: buildPackets(parsed), planEditedByHuman: true };
+				setState(next, ctx); // edits don't auto-approve: re-render + re-open the gate
+				await openPlanApprovalGate(ctx);
+			} catch (err) {
+				const message = err instanceof ArtifactError ? err.message : err instanceof Error ? err.message : String(err);
+				ctx.ui.notify(`code-changes: could not parse the edited plan: ${message}`, "warning");
+				await openPlanApprovalGate(ctx, { resend: false });
+			}
+			return;
+		}
+
+		if (choice === "Send feedback to revise") {
+			const feedback = await ctx.ui.editor("Revise the plan:", "");
+			if (!state) return;
+			setState(transition(state, "plan"), ctx);
+			await enterPhase(ctx, feedback?.trim());
+			return;
+		}
+
+		if (choice === "Stop the run") {
+			const stopped = { ...state, stopReason: "stopped by user at the plan approval gate" };
+			setState(transition(stopped, "stopped"), ctx);
+			await enterPhase(ctx);
+			return;
+		}
+	}
+
+	// -------------------------------------------------------------------------
 	// /change command
 	// -------------------------------------------------------------------------
 
-	const SUBCOMMANDS = ["status", "approve", "revise", "abort", "cleanup", "watch", "show", "triage", "review", "allow-push"];
+	const SUBCOMMANDS = ["status", "approve", "revise", "abort", "cleanup", "watch", "show", "triage", "review", "allow-push", "resume"];
 
 	/** Parses `--approved`/`--push` flags (any order, any combination) preceding the rest of the args. */
 	function parseFlags(args: string): { preApproved: boolean; pushAllowed: boolean; remainder: string } {
@@ -597,7 +690,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	pi.registerCommand("change", {
 		description:
 			"Start or control the code-changes workflow: /change [--approved] [--push] <task>, /change triage|review [--approved] [--push] <ref>, " +
-			"or status/approve/revise/abort/cleanup/watch/show/allow-push",
+			"or status/approve/revise/abort/cleanup/watch/show/allow-push/resume",
 		getArgumentCompletions(argumentPrefix: string) {
 			return SUBCOMMANDS.filter((s) => s.startsWith(argumentPrefix)).map((s) => ({ value: s, label: s }));
 		},
@@ -619,26 +712,63 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			}
 
 			if (first === "approve") {
-				if (!state || state.phase !== "awaiting_approval") {
-					ctx.ui.notify("code-changes: no analysis is awaiting approval.", "warning");
+				if (!state || (state.phase !== "awaiting_approval" && state.phase !== "awaiting_plan_approval")) {
+					ctx.ui.notify("code-changes: nothing is awaiting approval.", "warning");
 					return;
 				}
-				setState(transition(state, "plan"), ctx);
+				if (state.phase === "awaiting_approval") {
+					setState(transition(state, "plan"), ctx);
+				} else {
+					setState(transition(state, "delegate"), ctx);
+				}
 				await enterPhase(ctx);
 				return;
 			}
 
 			if (first === "revise") {
-				if (!state || state.phase !== "awaiting_approval") {
-					ctx.ui.notify("code-changes: no analysis is awaiting approval.", "warning");
+				if (!state || (state.phase !== "awaiting_approval" && state.phase !== "awaiting_plan_approval")) {
+					ctx.ui.notify("code-changes: nothing is awaiting approval.", "warning");
 					return;
 				}
 				if (!restText) {
 					ctx.ui.notify("code-changes: usage: /change revise <feedback>", "warning");
 					return;
 				}
-				setState(transition(state, "analyze"), ctx);
+				if (state.phase === "awaiting_approval") {
+					setState(transition(state, "analyze"), ctx);
+				} else {
+					setState(transition(state, "plan"), ctx);
+				}
 				await enterPhase(ctx, restText);
+				return;
+			}
+
+			if (first === "resume") {
+				if (!isActive(state)) {
+					ctx.ui.notify("code-changes: no active run.", "info");
+					return;
+				}
+				if (state.phase === "awaiting_approval" || state.phase === "awaiting_plan_approval") {
+					state = { ...state, transientRetries: 0, phasePromptSent: false };
+					persist();
+					if (state.phase === "awaiting_approval") await openApprovalGate(ctx);
+					else await openPlanApprovalGate(ctx);
+					return;
+				}
+				if (!MODEL_DRIVEN_PHASES.has(state.phase)) {
+					ctx.ui.notify(
+						`code-changes: /change resume only applies to a model-driven phase or an approval gate (current: ${PHASE_LABEL[state.phase]}).`,
+						"warning",
+					);
+					return;
+				}
+				const currentPhase = state.phase;
+				state = { ...state, transientRetries: 0, phasePromptSent: false };
+				persist();
+				await enterPhase(
+					ctx,
+					`Resuming after an interruption: continue the ${PHASE_LABEL[currentPhase]} phase from where it stopped; do not redo finished work.`,
+				);
 				return;
 			}
 
@@ -697,13 +827,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 					return;
 				}
 				if (state.analysis) sendAnalysisMessage(state);
-				if (state.plan) {
-					const lines = [
-						"# Plan task list",
-						...state.plan.tasks.map((t) => `- ${t.id} [${t.executor_tier}/${t.workspace}] deps=${t.dependencies.join(",") || "none"}`),
-					];
-					pi.sendMessage({ customType: "code-changes-phase", content: lines.join("\n"), display: true }, { triggerTurn: false });
-				}
+				if (state.plan) sendPlanMessage(state);
 				if (state.review) {
 					const lines = [
 						"# Reviewed diff summary",
@@ -727,6 +851,9 @@ export default function codeChanges(pi: ExtensionAPI): void {
 				if (state.phase === "awaiting_approval" && ctx.hasUI) {
 					await openApprovalGate(ctx, { resend: false });
 				}
+				if (state.phase === "awaiting_plan_approval" && ctx.hasUI) {
+					await openPlanApprovalGate(ctx, { resend: false });
+				}
 				return;
 			}
 
@@ -748,7 +875,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			const { preApproved, pushAllowed, remainder: task } = parseFlags(trimmed);
 			if (!task) {
 				ctx.ui.notify(
-					"code-changes: usage: /change [--approved] [--push] <task>, or /change status|approve|revise|abort|cleanup|watch|show|triage|review|allow-push",
+					"code-changes: usage: /change [--approved] [--push] <task>, or /change status|approve|revise|abort|cleanup|watch|show|triage|review|allow-push|resume",
 					"warning",
 				);
 				return;
@@ -803,7 +930,12 @@ export default function codeChanges(pi: ExtensionAPI): void {
 				let next = applyPlan(state, params);
 				next = { ...next, packets: buildPackets(next.plan!) };
 				setState(next, ctx);
-				return { content: [{ type: "text", text: `Plan submitted with ${next.plan?.tasks.length ?? 0} task(s). Phase is now ${PHASE_LABEL[next.phase]}.` }], details: next.plan, terminate: true };
+				const formatted = next.plan ? formatPlan(next.plan) : "";
+				return {
+					content: [{ type: "text", text: `Plan submitted with ${next.plan?.tasks.length ?? 0} task(s). Phase is now ${PHASE_LABEL[next.phase]}.\n\n${formatted}` }],
+					details: next.plan,
+					terminate: true,
+				};
 			} catch (err) {
 				if (err instanceof ArtifactError) throw new Error(err.message);
 				throw err;
@@ -1162,7 +1294,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		// immediately (see the agent_settled handler below).
 		if (state !== undefined && (state.phase === "done" || state.phase === "stopped")) return;
 		if (!isActive(state)) return;
-		if (state.phase === "awaiting_approval") return;
+		if (state.phase === "awaiting_approval" || state.phase === "awaiting_plan_approval") return;
 
 		if (!state.phasePromptSent) {
 			await enterPhase(ctx);
@@ -1184,19 +1316,71 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		}
 
 		if (!isActive(state)) return;
-		if (state.phase !== "awaiting_approval") {
+		if (state.phase !== "awaiting_approval" && state.phase !== "awaiting_plan_approval") {
 			// Last resort: the run went idle in a model-driven phase whose prompt was never delivered.
 			if (!state.phasePromptSent && MODEL_DRIVEN_PHASES.has(state.phase)) await enterPhase(ctx);
 			return;
 		}
 		if (state.phasePromptSent) return; // gate already asked for this awaiting period
+		const gatePhase = state.phase;
 		state = { ...state, phasePromptSent: true };
 		persist();
-		await openApprovalGate(ctx);
+		if (gatePhase === "awaiting_approval") await openApprovalGate(ctx);
+		else await openPlanApprovalGate(ctx);
 	});
 
 	// Stop hooks: enforced on every settling turn, active whether or not a /change run is running.
 	pi.on("agent_before_settle", async (event, ctx): Promise<AgentBeforeSettleEventResult | undefined> => {
+		// Transient provider errors pi's own agent-level retry didn't cover (e.g. "499 status code
+		// (no body)"): only while a /change run owns a model-driven phase, and only up to a bounded
+		// number of harness-owned retries. Must run before the stop-hook logic below, which already
+		// skips outcome "error" outright.
+		if (event.outcome === "error" && isActive(state) && MODEL_DRIVEN_PHASES.has(state.phase)) {
+			const messages = event.context.contextMessages ?? event.context.llmMessages ?? [];
+			let lastErrorMessage: string | undefined;
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const m = messages[i] as { role?: string; stopReason?: string; errorMessage?: string };
+				if (m && m.role === "assistant" && m.stopReason === "error") {
+					lastErrorMessage = m.errorMessage;
+					break;
+				}
+			}
+
+			const retries = state.transientRetries ?? 0;
+			if (isTransientProviderError(lastErrorMessage) && retries < MAX_TRANSIENT_RETRIES) {
+				const attempt = retries + 1;
+				state = { ...state, transientRetries: attempt };
+				persist();
+				ctx.ui.notify(`code-changes: provider error '${lastErrorMessage}'; retrying (${attempt}/${MAX_TRANSIENT_RETRIES}).`, "info");
+				try {
+					await retryBackoff(attempt, ctx.signal);
+				} catch {
+					return undefined; // aborted while waiting: fall through to normal settlement
+				}
+				// An error always settles on an assistant-role entry, which the harness alone treats as
+				// non-continuable (BoundaryContextPreview.canContinue): appending our own retry-feedback
+				// message is what actually makes the requested continuation valid, exactly like the
+				// stop-hook feedback loop below does for a blocked stop.
+				return {
+					entries: [
+						{
+							type: "custom_message",
+							customType: "code-changes-retry",
+							content: `code-changes: a transient provider error interrupted this turn ('${lastErrorMessage}'); retrying automatically (${attempt}/${MAX_TRANSIENT_RETRIES}). Continue the ${PHASE_LABEL[state.phase]} phase from where it stopped; do not redo finished work.`,
+							display: true,
+						},
+					],
+					continue: true,
+				};
+			}
+
+			ctx.ui.notify(
+				`code-changes: provider error${lastErrorMessage ? ` '${lastErrorMessage}'` : ""} could not be retried automatically. Run /change resume to continue this phase.`,
+				"warning",
+			);
+			return undefined;
+		}
+
 		if (event.outcome === "aborted" || event.outcome === "error") return undefined;
 		// No code changed in a read-only phase (analyze/awaiting_approval/plan/delegate/ci): nothing to check.
 		if (isActive(state) && READ_ONLY_PHASES.includes(state.phase)) return undefined;

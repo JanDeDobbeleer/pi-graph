@@ -65,3 +65,14 @@ When any tasks run in parallel worktrees, name the integration step now, before 
 A task list where each entry names its executor tier (see Phase 3), its workspace, its
 dependencies, and carries its pinned spec.
 <!-- /harness:enforced -->
+
+<!-- harness:enforced -->
+## Stop gate
+
+Report the plan — the task list with specs, executor tiers, workspaces, dependencies, and
+verification commands, plus the merge plan — and wait for a go before delegating. Skip the gate
+only when the user gave the go for implementation in the request itself ("do it", "fix it and
+commit", "implement with Sonnet"); approving the analysis at Phase 1's own gate is not, by itself,
+a go for this one. A revision sent back from this gate goes back through Plan and then through
+this gate again, not straight to Delegate.
+<!-- /harness:enforced -->

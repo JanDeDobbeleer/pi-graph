@@ -12,6 +12,7 @@ export type Phase =
 	| "analyze"
 	| "awaiting_approval"
 	| "plan"
+	| "awaiting_plan_approval"
 	| "delegate"
 	| "supervise"
 	| "verify"
@@ -24,6 +25,7 @@ export const PHASE_LABEL: Record<Phase, string> = {
 	analyze: "Analyze",
 	awaiting_approval: "Awaiting approval",
 	plan: "Plan",
+	awaiting_plan_approval: "Awaiting plan approval",
 	delegate: "Delegate",
 	supervise: "Supervise",
 	verify: "Verify",
@@ -202,6 +204,10 @@ export interface WorkflowState {
 	pushAllowed: boolean;
 	/** True when the human edited the analysis at the approval gate. */
 	analysisEditedByHuman?: boolean;
+	/** True when the human edited the plan at the plan approval gate. */
+	planEditedByHuman?: boolean;
+	/** Continuations after transient provider errors pi did not retry itself; reset on every phase change. */
+	transientRetries?: number;
 	analysis?: AnalysisReport;
 	plan?: TaskList;
 	packets: DelegationPacket[];
@@ -262,7 +268,9 @@ export const EDGES: Record<Phase, Phase[]> = {
 	analyze: ["awaiting_approval", "plan", "stopped"],
 	// "done" here is the issue-triage deliverable: the analysis itself was the product.
 	awaiting_approval: ["plan", "analyze", "done", "stopped"],
-	plan: ["delegate", "stopped"],
+	// "delegate" directly only when the user gave the go up front (/change --approved).
+	plan: ["awaiting_plan_approval", "delegate", "stopped"],
+	awaiting_plan_approval: ["delegate", "plan", "stopped"],
 	delegate: ["supervise", "stopped"],
 	supervise: ["verify", "stopped"],
 	verify: ["supervise", "analyze", "deliver", "stopped"],
@@ -276,7 +284,7 @@ export function transition(state: WorkflowState, to: Phase): WorkflowState {
 	if (!EDGES[state.phase].includes(to)) {
 		throw new Error(`Illegal transition ${state.phase} → ${to}`);
 	}
-	return { ...state, phase: to, phasePromptSent: false };
+	return { ...state, phase: to, phasePromptSent: false, transientRetries: 0 };
 }
 
 /** Rebuild state from the active branch: the last STATE_ENTRY custom entry wins. */

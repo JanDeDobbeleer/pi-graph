@@ -26,6 +26,7 @@ export const PHASE_TOOLS: Record<Phase, string[]> = {
 	analyze: ["read", "grep", "find", "ls", "bash", "powershell", "escalate", "submit_analysis"],
 	awaiting_approval: ["read", "grep", "find", "ls"],
 	plan: ["read", "grep", "find", "ls", "bash", "powershell", "submit_plan"],
+	awaiting_plan_approval: ["read", "grep", "find", "ls"],
 	delegate: ["read", "run_delegation"],
 	supervise: ["read", "grep", "find", "ls", "bash", "powershell", "edit", "write", "escalate", "resume_task", "submit_review"],
 	verify: ["read", "grep", "find", "ls", "bash", "powershell", "run_gates", "escalate", "submit_verification"],
@@ -42,6 +43,7 @@ export const PHASE_ARTIFACT_TOOL: Record<Phase, string | undefined> = {
 	analyze: "submit_analysis",
 	awaiting_approval: undefined,
 	plan: "submit_plan",
+	awaiting_plan_approval: undefined,
 	delegate: "run_delegation",
 	supervise: "submit_review",
 	verify: "submit_verification",
@@ -53,7 +55,7 @@ export const PHASE_ARTIFACT_TOOL: Record<Phase, string | undefined> = {
 };
 
 /** Phases where bash/powershell are restricted to read-only commands. */
-export const READ_ONLY_PHASES: Phase[] = ["analyze", "awaiting_approval", "plan", "delegate", "ci"];
+export const READ_ONLY_PHASES: Phase[] = ["analyze", "awaiting_approval", "plan", "awaiting_plan_approval", "delegate", "ci"];
 
 /**
  * Phases where extra read-only tools from other extensions (web fetch/search, MCP bridges, ...)
@@ -134,6 +136,13 @@ const SAFE_COMMANDS = new Set([
 	"gci",
 	"gc",
 	"sls",
+	"cd",
+	"pushd",
+	"popd",
+	"set-location",
+	"sl",
+	"push-location",
+	"pop-location",
 ]);
 
 // `fetch`/`ls-remote` only update remote-tracking refs or query a remote; neither writes to the
@@ -443,6 +452,9 @@ export type GateDecision = { block: true; reason: string } | undefined;
 function nextStepReason(phase: Phase, state: WorkflowState): string {
 	if (phase === "awaiting_approval") {
 		return "wait for the human to approve the analysis (/change approve)";
+	}
+	if (phase === "awaiting_plan_approval") {
+		return "wait for the human to approve the plan (/change approve)";
 	}
 	if (phase === "ci") {
 		const prNumber = state.pr?.number;

@@ -345,7 +345,100 @@ export function applyPlan(state: WorkflowState, plan: PlanParams): WorkflowState
 		throw new ArtifactError(`Plan is invalid:\n- ${problems.join("\n- ")}`);
 	}
 	const taskList: TaskList = { tasks: plan.tasks, merge_plan: plan.merge_plan };
-	return transition({ ...state, plan: taskList }, "delegate");
+	const next = state.preApproved ? "delegate" : "awaiting_plan_approval";
+	return transition({ ...state, plan: taskList }, next);
+}
+
+// ---------------------------------------------------------------------------
+// 4a. Plan <-> Markdown (plan-approval-gate display) and <-> editable JSON (human editing round trip)
+// ---------------------------------------------------------------------------
+
+/**
+ * Renders a task list as Markdown for the plan-approval-gate transcript message: one heading per
+ * task with its id, executor tier, workspace, dependencies, full spec, and verification commands,
+ * followed by the merge plan (if any).
+ */
+export function formatPlan(plan: TaskList, opts?: { edited?: boolean }): string {
+	const lines: string[] = [];
+	lines.push("# Plan");
+	if (opts?.edited) lines.push("_(edited by you)_");
+	for (const t of plan.tasks) {
+		lines.push("");
+		lines.push(`## Task ${t.id}`);
+		lines.push(`- executor tier: ${t.executor_tier}`);
+		lines.push(`- workspace: ${t.workspace}`);
+		lines.push(`- dependencies: ${t.dependencies.length > 0 ? t.dependencies.join(", ") : "none"}`);
+		lines.push("");
+		lines.push("### Spec");
+		lines.push(t.spec);
+		lines.push("");
+		lines.push("### Verification commands");
+		if (t.verification_commands.length > 0) {
+			for (const cmd of t.verification_commands) lines.push(`- ${cmd}`);
+		} else {
+			lines.push("- (none)");
+		}
+	}
+	lines.push("");
+	lines.push("## Merge plan");
+	if (plan.merge_plan) {
+		lines.push(`- order: ${plan.merge_plan.order.join(" -> ")}`);
+		lines.push(`- conflict owner: ${plan.merge_plan.conflict_owner}`);
+	} else {
+		lines.push("- (no more than one worktree task; nothing to merge)");
+	}
+	return lines.join("\n");
+}
+
+const PLAN_EDIT_COMMENT = [
+	"<!--",
+	"Edit the task list below, then save. This is the plan JSON the gate parses back on save:",
+	'  - tasks[].id: short unique identifier, e.g. "task-1"',
+	"  - tasks[].spec: approach, files/entry points, constraints, pinned skill rules, non-goals",
+	"  - tasks[].verification_commands: commands the executor must run and pass before reporting done",
+	'  - tasks[].executor_tier: "trivial" | "implementer" | "coordinator-direct"',
+	'  - tasks[].workspace: "main" | "worktree"',
+	"  - tasks[].dependencies: ids of other tasks in this plan that must land first, if any",
+	"  - merge_plan (required whenever more than one task runs in a worktree):",
+	"      order: task ids in the order their worktrees should be merged",
+	"      conflict_owner: who resolves a merge conflict between worktree tasks",
+	"-->",
+].join("\n");
+
+/** Renders a task list as the round-trippable editor prefill for the plan-approval-gate edit flow. */
+export function planToEditable(plan: TaskList): string {
+	const json = JSON.stringify(plan, null, 2);
+	return `${PLAN_EDIT_COMMENT}\n\n\`\`\`json\n${json}\n\`\`\`\n`;
+}
+
+/**
+ * Parses `planToEditable`'s editor text back into a `TaskList`: extracts the fenced ```json block
+ * (or treats the whole text as JSON when there's no fence), `JSON.parse`s it, then runs
+ * `validatePlan` and throws `ArtifactError` listing every problem found.
+ */
+export function parseEditablePlan(text: string): TaskList {
+	const fenced = text.match(/```json\s*([\s\S]*?)```/);
+	const jsonText = (fenced ? fenced[1] : text).trim();
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(jsonText);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new ArtifactError(`Edited plan is not valid JSON: ${message}`);
+	}
+
+	if (typeof parsed !== "object" || parsed === null || !Array.isArray((parsed as { tasks?: unknown }).tasks)) {
+		throw new ArtifactError('Edited plan is missing a "tasks" array.');
+	}
+
+	const plan = parsed as PlanParams;
+	const problems = validatePlan(plan);
+	if (problems.length > 0) {
+		throw new ArtifactError(`Edited plan is invalid:\n- ${problems.join("\n- ")}`);
+	}
+
+	return { tasks: plan.tasks, merge_plan: plan.merge_plan };
 }
 
 // ---------------------------------------------------------------------------

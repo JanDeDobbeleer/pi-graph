@@ -52,12 +52,17 @@ pi -e ./extensions/code-changes/index.ts
                                  (--approved and --push combine, and go before the task/issue/pr)
 /change allow-push               allow push/PR/replies mid-run, without restarting it
 /change status                   show the active run's phase and failure count
-/change show                     re-print the current analysis/plan/review
-/change approve                  approve the analysis, continue to Plan
-/change revise <feedback>        send the analysis back to Analyze with feedback
+/change show                     re-print the current analysis/plan/review (re-opens the active
+                                 gate, analysis or plan, when there's UI)
+/change approve                  approve the analysis or the plan (whichever gate is open),
+                                 continue to Plan or Delegate respectively
+/change revise <feedback>        send the analysis or plan (whichever gate is open) back to
+                                 Analyze/Plan with feedback
 /change abort                    stop the run and clean up worktrees
 /change cleanup                  remove any leftover worktrees for the active run
 /change watch [pr]               watch a PR's checks (explicit; also restarts a stalled/timed-out watch)
+/change resume                   re-send the current phase's instructions (or re-open the active
+                                 gate) after an interruption, resetting the transient-retry counter
 ```
 
 At the Analyze approval gate, the human picks one of: **Approve**; **Approve and allow push/PR**
@@ -66,6 +71,14 @@ pre-filled with the analysis — the edits become the approved artifact, recorde
 `analysisEditedByHuman`); **Send feedback to revise** (same as `/change revise`); **Done — triage
 only** (issue-triage entry only: end the run here with the analysis as the deliverable, no
 implementation); or **Stop**.
+
+Plan ends with its own gate, right after `submit_plan`, mirroring the analysis gate: **Approve —
+start delegation**; **Edit the plan myself** (opens an editor pre-filled with the plan as JSON,
+preceded by a short comment explaining the fields — the edits become the approved plan, recorded as
+`planEditedByHuman`, and packets are rebuilt from it); **Send feedback to revise** (back to Plan
+with the feedback); or **Stop**. Both gates are skipped only when the run was started with
+`/change --approved` (`state.preApproved`); `/change approve`, `/change revise <feedback>`, and
+`/change show` all work against whichever gate — analysis or plan — is currently open.
 
 Supervise can hand a stuck implementer a decision without restarting it: `resume_task` (params
 `task_id`, `answer`) resumes that task in its own workspace. Implementers report a blocking
@@ -82,10 +95,12 @@ read them. The analysis, final report, hook failures and CI failures always rend
 | Gate | Mechanism |
 |------|-----------|
 | Only the current phase's tools are callable | `tool_call` handler + `pi.setActiveTools(...)` per phase |
-| Analyze/Plan/Delegate/CI are read-only (no edit/write, bash restricted) | `isReadOnlyCommand` allowlist in `gates.ts` |
+| Analyze/Plan/awaiting_plan_approval/Delegate/CI are read-only (no edit/write, bash restricted) | `isReadOnlyCommand` allowlist in `gates.ts`, including directory-navigation commands (`cd`, `pushd`/`popd`, `Set-Location`/`sl`, `Push-Location`/`Pop-Location`) |
 | Analyze and Plan can still fetch external context (issues, PRs, docs) | read-only `gh` (issue/pr/run/workflow/release `view`/`list`, `pr diff`/`checks`, `repo view`, `search`, `label list`, read-only `api`), `curl`/`Invoke-WebRequest` GETs, and `git fetch`/`git ls-remote` are allowed by `isReadOnlyCommand`; any registered read-only tools from other extensions (web fetch/search, MCP bridges) are also activated — see `readOnlyTools` below |
 | A phase cannot be left without its artifact | one `submit_*` tool per edge; validation throws until the artifact is complete |
-| The human approves (or revises) the analysis | `agent_end` gate: `ctx.ui.select` when Analyze finishes, or `/change approve|revise` |
+| The human approves (or revises) the analysis | `agent_settled` gate: `ctx.ui.select` when Analyze finishes, or `/change approve|revise` |
+| The human approves (or revises) the plan | `agent_settled` gate: `ctx.ui.select` when Plan finishes, or `/change approve|revise`; skipped only when the run started with `/change --approved` |
+| A transient provider error pi's own retry doesn't cover (e.g. `499`) doesn't kill the run | `agent_before_settle` catches `outcome: "error"`, matches `isTransientProviderError` (`retry.ts`), and retries up to 3 times with backoff before asking the user to `/change resume` |
 | Verify's "pass" needs real gate results | `run_gates` records exit codes; `submit_verification` rejects "pass" unless every required command is on record and green |
 | Verify's "pass" needs green stop hooks | `submit_verification` runs the repo's Stop hooks itself right before checking "pass"; any hook that blocks rejects the pass (named, with its reason) |
 | Verify's "pass" is refused while a CI failure is unclassified | `state.ciFailure` must be cleared by a `submit_verification` **fail** first |
@@ -203,6 +218,27 @@ success while CI is still red.
   PR per session — after that the harness only notifies instead of prompting another turn.
 - Requires an authenticated `gh` (GitHub CLI); without it, `resolvePr`/`gh pr checks` simply find
   nothing to watch, and a run without a detected PR completes normally at **done**.
+
+## Transient provider errors
+
+pi's own agent-level retry (`pi-ai`'s `RETRYABLE_PROVIDER_ERROR_PATTERN`) already covers the common
+transient cases — 429/500/502/503/504, network errors, timeouts — but not everything a gateway can
+return mid-stream, e.g. `499 status code (no body)`. Without a second layer, one of those kills the
+whole `/change` run.
+
+- While a `/change` run owns a model-driven phase (Analyze, Plan, Delegate, Supervise, Verify,
+  Deliver) and the turn ends with `outcome: "error"`, `agent_before_settle` looks at the last
+  assistant message's `errorMessage` and, if it matches `isTransientProviderError` (`retry.ts`) and
+  the run hasn't already retried 3 times for this phase (`WorkflowState.transientRetries`, reset on
+  every phase transition), waits a backoff (`2000 * 2^(n-1)` ms, abortable) and feeds the model a
+  short retry-feedback message so the turn continues automatically. The user sees an info
+  notification each time.
+- Quota/billing/auth/validation errors (`insufficient_quota`, `401`/`403`, "context length
+  exceeded", ...) are never treated as transient, even if they happen to also match a transient
+  pattern.
+- Once the cap is reached, a warning notification points at `/change resume`, which resets the
+  retry counter and re-sends the current phase's instructions (or re-opens the active gate),
+  telling the model to continue from where it stopped without redoing finished work.
 
 ## Model tiers
 

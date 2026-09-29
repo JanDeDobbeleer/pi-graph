@@ -14,12 +14,15 @@ import {
 	buildPackets,
 	summarizeState,
 	formatAnalysis,
+	formatPlan,
 	parseAnalysisMarkdown,
+	parseEditablePlan,
+	planToEditable,
 	ArtifactError,
 	type PlanParams,
 	type AnalysisParams,
 } from "../extensions/code-changes/artifacts.ts";
-import type { AnalysisReport } from "../extensions/code-changes/state.ts";
+import type { AnalysisReport, TaskList } from "../extensions/code-changes/state.ts";
 
 function baseState(overrides: Partial<WorkflowState> = {}): WorkflowState {
 	return { ...newState("do the thing", [], "deadbeef"), ...overrides };
@@ -237,10 +240,75 @@ describe("applyPlan", () => {
 		}
 	});
 
-	it("transitions to delegate on success", () => {
-		const s = applyPlan(baseState({ phase: "plan" }), { tasks: [task()] });
+	it("transitions to awaiting_plan_approval on success when not preApproved", () => {
+		const s = applyPlan(baseState({ phase: "plan", preApproved: false }), { tasks: [task()] });
+		expect(s.phase).toBe("awaiting_plan_approval");
+		expect(s.plan?.tasks.length).toBe(1);
+	});
+
+	it("transitions straight to delegate on success when preApproved", () => {
+		const s = applyPlan(baseState({ phase: "plan", preApproved: true }), { tasks: [task()] });
 		expect(s.phase).toBe("delegate");
 		expect(s.plan?.tasks.length).toBe(1);
+	});
+});
+
+describe("formatPlan / planToEditable / parseEditablePlan", () => {
+	function plan(overrides: Partial<TaskList> = {}): TaskList {
+		return { tasks: [task()], ...overrides };
+	}
+
+	it("formatPlan includes id, tier, workspace, dependencies, spec, and verification commands", () => {
+		const p = plan({ tasks: [task({ id: "t1", executor_tier: "implementer", workspace: "worktree", dependencies: ["t0"] })] });
+		const md = formatPlan(p);
+		expect(md).toContain("Task t1");
+		expect(md).toContain("implementer");
+		expect(md).toContain("worktree");
+		expect(md).toContain("t0");
+		expect(md).toContain("do the work");
+		expect(md).toContain("npm test");
+	});
+
+	it("formatPlan includes the merge plan when present", () => {
+		const p = plan({
+			tasks: [task({ id: "a", workspace: "worktree" }), task({ id: "b", workspace: "worktree" })],
+			merge_plan: { order: ["a", "b"], conflict_owner: "coordinator" },
+		});
+		const md = formatPlan(p);
+		expect(md).toContain("a -> b");
+		expect(md).toContain("coordinator");
+	});
+
+	it("marks the edited-by-you note", () => {
+		const md = formatPlan(plan(), { edited: true });
+		expect(md).toContain("edited by you");
+	});
+
+	it("planToEditable / parseEditablePlan round-trips a plan", () => {
+		const p = plan();
+		const editable = planToEditable(p);
+		expect(editable).toContain("```json");
+		expect(parseEditablePlan(editable)).toEqual(p);
+	});
+
+	it("parseEditablePlan parses bare JSON with no fence", () => {
+		const p = plan();
+		expect(parseEditablePlan(JSON.stringify(p))).toEqual(p);
+	});
+
+	it("parseEditablePlan throws ArtifactError on invalid JSON", () => {
+		expect(() => parseEditablePlan("not json at all")).toThrow(ArtifactError);
+	});
+
+	it("parseEditablePlan throws ArtifactError listing validation problems", () => {
+		const bad = JSON.stringify({ tasks: [] });
+		try {
+			parseEditablePlan(bad);
+			expect.unreachable();
+		} catch (e) {
+			expect(e).toBeInstanceOf(ArtifactError);
+			expect((e as Error).message).toContain("at least one task");
+		}
 	});
 });
 

@@ -318,6 +318,10 @@ export function phaseReminder(state: WorkflowState): string {
 		);
 		return lines.join("\n");
 	}
+	if (state.phase === "awaiting_plan_approval") {
+		lines.push("Plan submitted; waiting for the human to approve it.");
+		return lines.join("\n");
+	}
 	const artifactTool = PHASE_ARTIFACT_TOOL[state.phase];
 	lines.push(artifactTool ? `Exit this phase by calling \`${artifactTool}\`.` : "This phase awaits a human decision (/change approve|revise|abort).");
 	return lines.join("\n");
