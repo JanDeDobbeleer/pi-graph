@@ -9,10 +9,11 @@
  */
 
 import { Type } from "typebox";
-import { Markdown } from "@earendil-works/pi-tui";
+import { Markdown, Text } from "@earendil-works/pi-tui";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import type {
 	AgentBeforeSettleEventResult,
+	TurnEndEventResult,
 	BeforeAgentStartEventResult,
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -69,6 +70,15 @@ import {
 // Phases in which the model is prompted and must produce an artifact to advance.
 const MODEL_DRIVEN_PHASES: ReadonlySet<Phase> = new Set(["analyze", "plan", "delegate", "supervise", "verify", "deliver"]);
 
+const PHASE_PROMPT_MESSAGE = "code-changes-phase-prompt";
+
+interface PhasePromptDetails {
+	phase: Phase;
+	runId: string;
+	/** True when the prompt carries extra context (revise feedback, CI failure, failure record). */
+	extra: boolean;
+}
+
 // Cap on automatic CI-triggered fix turns per PR per session when CI fails *outside* a /change
 // run (inside a run the normal Verify retry cap already applies once routed back from "ci").
 const CI_FIX_CAP = 2;
@@ -98,6 +108,20 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			? message.content
 			: message.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
 		return new Markdown(text, 1, 0, getMarkdownTheme());
+	});
+
+	// Phase prompts carry the full reference Markdown for the model; in the transcript they
+	// collapse to a one-line header and expand with pi's expanded view.
+	pi.registerMessageRenderer<PhasePromptDetails>(PHASE_PROMPT_MESSAGE, (message, options, theme) => {
+		const text = typeof message.content === "string"
+			? message.content
+			: message.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
+		if (options.expanded) return new Markdown(text, 1, 0, getMarkdownTheme());
+		const details = message.details;
+		const phase = details ? PHASE_LABEL[details.phase] : "phase";
+		const run = details ? ` (run ${details.runId})` : "";
+		const extra = details?.extra ? " · with feedback" : "";
+		return new Text(theme.fg("muted", `code-changes · ${phase} phase${run}${extra} · expand to read the instructions`), 1, 0);
 	});
 
 	// -------------------------------------------------------------------------
@@ -250,12 +274,18 @@ export default function codeChanges(pi: ExtensionAPI): void {
 
 		if (!MODEL_DRIVEN_PHASES.has(state.phase)) return;
 
-		await applyCoordinatorModel(ctx);
+		const message = await takePhasePrompt(ctx, extra);
+		pi.sendMessage(message, { triggerTurn: true, deliverAs: "followUp" });
+	}
 
-		const prompt = phasePrompt(state, extra);
-		state = { ...state, phasePromptSent: true };
+	/** Builds the current phase's prompt message and marks it sent. Caller delivers it. */
+	async function takePhasePrompt(ctx: ExtensionContext, extra?: string) {
+		const current = state!;
+		await applyCoordinatorModel(ctx);
+		state = { ...current, phasePromptSent: true };
 		persist();
-		pi.sendMessage({ customType: "code-changes-phase", content: prompt, display: true }, { triggerTurn: true, deliverAs: "followUp" });
+		const details: PhasePromptDetails = { phase: current.phase, runId: current.id, extra: extra !== undefined && extra.trim() !== "" };
+		return { customType: PHASE_PROMPT_MESSAGE, content: phasePrompt(current, extra), display: true, details };
 	}
 
 	// -------------------------------------------------------------------------
@@ -1113,6 +1143,16 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		return { message: { customType: "code-changes-reminder", content: phaseReminder(state), display: false } };
 	});
 
+	// A tool that moves the run to the next phase can do so mid-run (the model keeps going after a
+	// follow-up turn, or batched another call with it), so agent_end is not guaranteed to fire
+	// before the model acts in the new phase. Hand over the next phase's instructions right after
+	// the tool batch that changed the phase, and ask pi for the next model request.
+	pi.on("turn_end", async (_event, ctx): Promise<TurnEndEventResult | undefined> => {
+		if (!isActive(state) || state.phasePromptSent || !MODEL_DRIVEN_PHASES.has(state.phase)) return undefined;
+		const message = await takePhasePrompt(ctx);
+		return { entries: [{ type: "custom_message", ...message }], continue: true };
+	});
+
 	pi.on("agent_end", async (_event, ctx) => {
 		// The approval gate (awaiting_approval) and the final done/stopped report are handled from
 		// agent_settled instead: sendMessage(..., {triggerTurn:false}) called here, while the
@@ -1144,7 +1184,11 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		}
 
 		if (!isActive(state)) return;
-		if (state.phase !== "awaiting_approval") return;
+		if (state.phase !== "awaiting_approval") {
+			// Last resort: the run went idle in a model-driven phase whose prompt was never delivered.
+			if (!state.phasePromptSent && MODEL_DRIVEN_PHASES.has(state.phase)) await enterPhase(ctx);
+			return;
+		}
 		if (state.phasePromptSent) return; // gate already asked for this awaiting period
 		state = { ...state, phasePromptSent: true };
 		persist();

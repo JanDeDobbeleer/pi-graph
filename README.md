@@ -70,8 +70,12 @@ implementation); or **Stop**.
 Supervise can hand a stuck implementer a decision without restarting it: `resume_task` (params
 `task_id`, `answer`) resumes that task in its own workspace. Implementers report a blocking
 ambiguity with a `SPEC GAP:` line; a task also has a per-task time budget — an implementer that
-exceeds it is killed and marked stalled. A second `SPEC GAP:` on the same task, or a second stall,
-escalates automatically instead of asking Supervise to keep deciding.
+exceeds it is killed and marked stalled. A second `SPEC GAP:` on the same task escalates
+automatically instead of asking Supervise to keep deciding.
+
+Each phase's instructions (the stripped skill references) go to the model in full, but the
+transcript shows them as a one-line `code-changes · <Phase> phase` header; expand tool output to
+read them. The analysis, final report, hook failures and CI failures always render in full.
 
 ## What is enforced
 

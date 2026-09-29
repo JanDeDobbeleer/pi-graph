@@ -312,6 +312,11 @@ describe("code-changes e2e (real pi runtime, scripted fake model)", () => {
 					.reverse()
 					.find((m) => m.role !== "user" && (m as any).customType === "code-changes-phase");
 				expect(finalMessage).toBeDefined();
+
+				// Phase instructions go out as their own message type so the transcript can collapse them.
+				const phasePrompts = session.messages.filter((m) => (m as any).customType === "code-changes-phase-prompt");
+				// Every model-driven phase gets its instructions exactly once, in graph order.
+				expect(phasePrompts.map((m) => (m as any).details?.phase)).toEqual(["analyze", "plan", "delegate", "supervise", "verify", "deliver"]);
 			} finally {
 				session.dispose();
 			}
