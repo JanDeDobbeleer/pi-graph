@@ -79,6 +79,7 @@ escalates automatically instead of asking Supervise to keep deciding.
 |------|-----------|
 | Only the current phase's tools are callable | `tool_call` handler + `pi.setActiveTools(...)` per phase |
 | Analyze/Plan/Delegate/CI are read-only (no edit/write, bash restricted) | `isReadOnlyCommand` allowlist in `gates.ts` |
+| Analyze and Plan can still fetch external context (issues, PRs, docs) | read-only `gh` (issue/pr/run/workflow/release `view`/`list`, `pr diff`/`checks`, `repo view`, `search`, `label list`, read-only `api`), `curl`/`Invoke-WebRequest` GETs, and `git fetch`/`git ls-remote` are allowed by `isReadOnlyCommand`; any registered read-only tools from other extensions (web fetch/search, MCP bridges) are also activated — see `readOnlyTools` below |
 | A phase cannot be left without its artifact | one `submit_*` tool per edge; validation throws until the artifact is complete |
 | The human approves (or revises) the analysis | `agent_end` gate: `ctx.ui.select` when Analyze finishes, or `/change approve|revise` |
 | Verify's "pass" needs real gate results | `run_gates` records exit codes; `submit_verification` rejects "pass" unless every required command is on record and green |
@@ -211,13 +212,23 @@ Configure per-tier models in `~/.pi/agent/code-changes.json` (personal) or `.pi/
     "coordinator": "session",
     "implementer": "anthropic/claude-sonnet-5",
     "trivial": "anthropic/claude-haiku-4-5"
-  }
+  },
+  "readOnlyTools": ["mcp__docs__*"]
 }
 ```
 
 Defaults (from `models.ts`) are shown above. `"session"` (or omitting a tier) keeps whatever model
 the session is already using instead of switching. An unresolvable model reference falls back to
 the current model and triggers a one-time warning.
+
+`readOnlyTools` names (glob patterns with `*` allowed) other registered extensions' read-only tools
+— web fetch/search, MCP documentation bridges, and similar — that should be activated on top of the
+phase's built-in tool set in Analyze, Plan, Supervise, and Verify (never Delegate, CI, or
+awaiting_approval, which don't do research). The default list already covers the common names
+(`web_fetch`, `webfetch`, `fetch`, `web_search`, `websearch`, `search`); user config and project
+config both add to that list rather than replacing it, and an entry that names `edit`, `write`,
+`bash`, `powershell`, or any workflow tool is ignored so it can never widen what a read-only phase
+can actually do.
 
 ## Delegation details
 

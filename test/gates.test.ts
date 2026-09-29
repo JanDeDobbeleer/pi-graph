@@ -25,6 +25,14 @@ describe("isReadOnlyCommand", () => {
 		"cat package.json",
 		"npm view left-pad",
 		"go env GOPATH",
+		"gh issue view 12 --comments",
+		"gh pr view 3 --json title,body | jq .title",
+		"gh api repos/o/r/issues/1/comments --paginate",
+		"gh search issues foo",
+		"curl -sL https://x | head",
+		"git fetch origin",
+		"git ls-remote origin",
+		"irm https://x",
 	])("accepts %s", (command) => {
 		expect(isReadOnlyCommand(command)).toBe(true);
 	});
@@ -40,6 +48,17 @@ describe("isReadOnlyCommand", () => {
 		"cat x | tee y",
 		"echo `rm -rf /`",
 		"npm install left-pad",
+		"gh pr create",
+		"gh pr merge 1",
+		"gh api -X POST repos/o/r/issues",
+		"gh api repos/o/r/issues -f title=x",
+		"gh issue comment 1 -b x",
+		"gh pr checkout 1",
+		"curl -o f https://x",
+		"curl -d a=b https://x",
+		"curl -X DELETE https://x",
+		"iwr https://x -OutFile f",
+		"git fetch && git reset --hard",
 	])("rejects %s", (command) => {
 		expect(isReadOnlyCommand(command)).toBe(false);
 	});
@@ -238,6 +257,37 @@ describe("decideToolCall", () => {
 		it("does not apply the push/staging gates when no run is active", () => {
 			expect(decideToolCall(undefined, "bash", { command: "git push --force origin main" })).toBeUndefined();
 			expect(decideToolCall(undefined, "bash", { command: "git add -A" })).toBeUndefined();
+		});
+	});
+
+	// -------------------------------------------------------------------------
+	// Extra read-only tools from other extensions
+	// -------------------------------------------------------------------------
+
+	describe("extra read-only tools", () => {
+		it("allows a configured extra read-only tool in analyze", () => {
+			const decision = decideToolCall(stateInPhase("analyze"), "web_fetch", {}, ["web_fetch"]);
+			expect(decision).toBeUndefined();
+		});
+
+		it("blocks a configured extra read-only tool in awaiting_approval", () => {
+			const decision = decideToolCall(stateInPhase("awaiting_approval"), "web_fetch", {}, ["web_fetch"]);
+			expect(decision?.block).toBe(true);
+		});
+
+		it("ignores an extra read-only entry that shadows a built-in tool name", () => {
+			const decision = decideToolCall(stateInPhase("analyze"), "edit", {}, ["edit"]);
+			expect(decision?.block).toBe(true);
+		});
+
+		it("supports glob patterns", () => {
+			const decision = decideToolCall(stateInPhase("plan"), "mcp__docs__fetch", {}, ["mcp__docs__*"]);
+			expect(decision).toBeUndefined();
+		});
+
+		it("does not affect phases without extra read-only tools when none are configured", () => {
+			const decision = decideToolCall(stateInPhase("analyze"), "web_fetch", {});
+			expect(decision?.block).toBe(true);
 		});
 	});
 });

@@ -55,9 +55,47 @@ export const PHASE_ARTIFACT_TOOL: Record<Phase, string | undefined> = {
 /** Phases where bash/powershell are restricted to read-only commands. */
 export const READ_ONLY_PHASES: Phase[] = ["analyze", "awaiting_approval", "plan", "delegate", "ci"];
 
-export function toolsForPhase(phase: Phase, registered: string[]): string[] {
+/**
+ * Phases where extra read-only tools from other extensions (web fetch/search, MCP bridges, ...)
+ * are activated on top of PHASE_TOOLS: Analyze and Plan need external context (analyze.md's
+ * `gh issue view`/`gh pr view` guidance extends to non-shell tools too), and Supervise/Verify may
+ * legitimately need to read documentation while implementing/checking. Delegate, CI, and
+ * awaiting_approval are deliberately excluded: Delegate/CI are non-interactive, and
+ * awaiting_approval is a human gate, not a phase where the model should be doing research.
+ */
+const EXTRA_READ_ONLY_PHASES: Phase[] = ["analyze", "plan", "supervise", "verify"];
+
+/** Names an extra-read-only-tools entry may never refer to, however it's spelled or globbed. */
+const SHADOW_FORBIDDEN_NAMES = new Set<string>(["edit", "write", "bash", "powershell", ...WORKFLOW_TOOLS]);
+
+function escapeRegExpLiteral(segment: string): string {
+	return segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Matches `name` against a glob pattern where `*` means "any run of characters". */
+function matchesGlob(name: string, pattern: string): boolean {
+	if (pattern === name) return true;
+	if (!pattern.includes("*")) return false;
+	const regex = new RegExp(`^${pattern.split("*").map(escapeRegExpLiteral).join(".*")}$`);
+	return regex.test(name);
+}
+
+/** Drops entries that would shadow a built-in edit/write/bash/powershell or workflow tool name. */
+function sanitizeExtraReadOnly(extraReadOnly: string[]): string[] {
+	return extraReadOnly.filter((pattern) => !SHADOW_FORBIDDEN_NAMES.has(pattern));
+}
+
+export function toolsForPhase(phase: Phase, registered: string[], extraReadOnly: string[] = []): string[] {
 	const registeredSet = new Set(registered);
-	return PHASE_TOOLS[phase].filter((name) => registeredSet.has(name));
+	const base = PHASE_TOOLS[phase].filter((name) => registeredSet.has(name));
+	if (!EXTRA_READ_ONLY_PHASES.includes(phase)) return base;
+
+	const patterns = sanitizeExtraReadOnly(extraReadOnly);
+	if (patterns.length === 0) return base;
+
+	const baseSet = new Set(base);
+	const extras = registered.filter((name) => !baseSet.has(name) && patterns.some((p) => matchesGlob(name, p)));
+	return [...base, ...extras];
 }
 
 // First-word allowlist for bash/powershell segments. Subcommand-sensitive tools
@@ -98,9 +136,128 @@ const SAFE_COMMANDS = new Set([
 	"sls",
 ]);
 
-const GIT_SIMPLE_SUBCOMMANDS = new Set(["status", "log", "show", "diff", "blame", "grep", "ls-files", "rev-parse", "describe", "shortlog", "cat-file"]);
+// `fetch`/`ls-remote` only update remote-tracking refs or query a remote; neither writes to the
+// working tree or a branch a push could reach, so they're as read-only as `log`/`status`.
+const GIT_SIMPLE_SUBCOMMANDS = new Set([
+	"status",
+	"log",
+	"show",
+	"diff",
+	"blame",
+	"grep",
+	"ls-files",
+	"rev-parse",
+	"describe",
+	"shortlog",
+	"cat-file",
+	"fetch",
+	"ls-remote",
+]);
 const GO_SUBCOMMANDS = new Set(["list", "env", "version", "doc"]);
 const NPM_SUBCOMMANDS = new Set(["ls", "view"]);
+
+// gh subcommands whose top-level verb is read-only. `search` and `api` are validated separately
+// (search takes anything after it; api needs the method/field-flag check below).
+const GH_READONLY_SUBCOMMANDS: Record<string, string[]> = {
+	issue: ["view", "list", "status"],
+	pr: ["view", "list", "diff", "checks", "status"],
+	run: ["view", "list"],
+	workflow: ["view", "list"],
+	release: ["view", "list"],
+};
+
+const MUTATING_GH_API_METHODS = new Set(["POST", "PATCH", "PUT", "DELETE"]);
+
+/** `gh api ...`: read-only only with no explicit mutating method and no field flags (which default gh api to POST). */
+function isSafeGhApi(args: string[]): boolean {
+	if (args.length === 0) return false;
+	for (let i = 0; i < args.length; i++) {
+		const tok = args[i];
+		if (tok === "-X" || tok === "--method") {
+			const method = (args[i + 1] ?? "").toUpperCase();
+			if (MUTATING_GH_API_METHODS.has(method) || method === "") return false;
+			i++;
+			continue;
+		}
+		if (tok.startsWith("-X") && tok.length > 2) {
+			if (MUTATING_GH_API_METHODS.has(tok.slice(2).toUpperCase())) return false;
+			continue;
+		}
+		if (tok.startsWith("--method=")) {
+			if (MUTATING_GH_API_METHODS.has(tok.slice("--method=".length).toUpperCase())) return false;
+			continue;
+		}
+		if (tok === "-f" || tok === "-F" || tok === "--field" || tok === "--raw-field" || tok === "--input" || tok.startsWith("--input=")) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/** `gh ...`: read subcommands only (issue/pr/run/workflow/release view|list, pr diff|checks, repo view, search, label list, read-only api). Never `--web` (opens a browser, not read-only in a headless sense). */
+function isSafeGh(args: string[]): boolean {
+	const top = args[0];
+	if (top === undefined) return false;
+	if (args.includes("--web")) return false;
+	const rest = args.slice(1);
+	const readonlySubs = GH_READONLY_SUBCOMMANDS[top];
+	if (readonlySubs) return rest[0] !== undefined && readonlySubs.includes(rest[0]);
+	if (top === "repo") return rest[0] === "view";
+	if (top === "search") return true;
+	if (top === "label") return rest[0] === "list";
+	if (top === "api") return isSafeGhApi(rest);
+	return false;
+}
+
+/** `curl ...`: GETs to stdout only. Anything writing to a file, sending a body, or using a non-GET/HEAD method is rejected. */
+function isSafeCurl(args: string[]): boolean {
+	for (let i = 0; i < args.length; i++) {
+		const tok = args[i];
+		if (tok === "-o" || tok === "--output" || tok === "-O" || tok.startsWith("--remote-name")) return false;
+		if (
+			tok === "-d" ||
+			tok.startsWith("--data") ||
+			tok === "-F" ||
+			tok === "--form" ||
+			tok === "-T" ||
+			tok === "--upload-file" ||
+			tok === "--json"
+		) {
+			return false;
+		}
+		if (tok === "-K" || tok === "--config") return false;
+		if (tok === "-X" || tok === "--request") {
+			const method = (args[i + 1] ?? "").toUpperCase();
+			if (method !== "GET" && method !== "HEAD") return false;
+			i++;
+			continue;
+		}
+		if (tok.startsWith("--request=")) {
+			const method = tok.slice("--request=".length).toUpperCase();
+			if (method !== "GET" && method !== "HEAD") return false;
+		}
+	}
+	return true;
+}
+
+/** `Invoke-WebRequest`/`Invoke-RestMethod`/`iwr`/`irm`: same GET-to-stdout constraint as curl, PowerShell-flavored. */
+function isSafeInvokeWeb(args: string[]): boolean {
+	for (let i = 0; i < args.length; i++) {
+		const low = args[i].toLowerCase();
+		if (low === "-outfile" || low === "-body" || low === "-infile") return false;
+		if (low === "-method") {
+			const method = (args[i + 1] ?? "").toUpperCase();
+			if (method !== "GET" && method !== "HEAD") return false;
+			i++;
+			continue;
+		}
+		if (low.startsWith("-method:")) {
+			const method = low.slice("-method:".length).toUpperCase();
+			if (method !== "GET" && method !== "HEAD") return false;
+		}
+	}
+	return true;
+}
 
 function isSafeGit(args: string[]): boolean {
 	const sub = args[0];
@@ -139,6 +296,15 @@ function isSafeSegment(segment: string): boolean {
 			return isSafeNode(tokens.slice(1));
 		case "npm":
 			return isSafeNpm(tokens.slice(1));
+		case "gh":
+			return isSafeGh(tokens.slice(1));
+		case "curl":
+			return isSafeCurl(tokens.slice(1));
+		case "invoke-webrequest":
+		case "invoke-restmethod":
+		case "iwr":
+		case "irm":
+			return isSafeInvokeWeb(tokens.slice(1));
 		default:
 			return SAFE_COMMANDS.has(cmd);
 	}
@@ -292,7 +458,12 @@ function nextStepReason(phase: Phase, state: WorkflowState): string {
  * Enforcement wired into pi's `tool_call` handler. Blocks tool calls the current phase
  * does not allow, and restricts bash/powershell to read-only commands in read-only phases.
  */
-export function decideToolCall(state: WorkflowState | undefined, toolName: string, input: Record<string, unknown>): GateDecision {
+export function decideToolCall(
+	state: WorkflowState | undefined,
+	toolName: string,
+	input: Record<string, unknown>,
+	extraReadOnly: string[] = [],
+): GateDecision {
 	if (state === undefined || state.phase === "done" || state.phase === "stopped") {
 		if (WORKFLOW_TOOLS.includes(toolName)) {
 			return { block: true, reason: "No /change run is active." };
@@ -312,6 +483,12 @@ export function decideToolCall(state: WorkflowState | undefined, toolName: strin
 						? `CI checks are running for PR #${prNumber}; the harness resumes the run when they finish (/change status).`
 						: "CI checks are running; the harness resumes the run when they finish (/change status).",
 			};
+		}
+		if (EXTRA_READ_ONLY_PHASES.includes(phase)) {
+			const patterns = sanitizeExtraReadOnly(extraReadOnly);
+			if (patterns.some((p) => matchesGlob(toolName, p))) {
+				return undefined;
+			}
 		}
 		const label = PHASE_LABEL[phase];
 		return {

@@ -2,7 +2,16 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DEFAULT_TIERS, loadTierConfig, parseModelRef, resolveTierModel, tierForExecutor, modelRef } from "../extensions/code-changes/models.ts";
+import {
+	DEFAULT_READ_ONLY_TOOLS,
+	DEFAULT_TIERS,
+	loadReadOnlyTools,
+	loadTierConfig,
+	modelRef,
+	parseModelRef,
+	resolveTierModel,
+	tierForExecutor,
+} from "../extensions/code-changes/models.ts";
 
 describe("parseModelRef", () => {
 	it("splits provider and id on the first slash", () => {
@@ -68,6 +77,60 @@ describe("loadTierConfig", () => {
 
 		expect(() => loadTierConfig(cwdDir, homeDir)).not.toThrow();
 		expect(loadTierConfig(cwdDir, homeDir)).toEqual(DEFAULT_TIERS);
+	});
+});
+
+describe("loadReadOnlyTools", () => {
+	let homeDir: string;
+	let cwdDir: string;
+
+	beforeEach(() => {
+		homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-ro-home-"));
+		cwdDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-ro-cwd-"));
+	});
+
+	afterEach(() => {
+		fs.rmSync(homeDir, { recursive: true, force: true });
+		fs.rmSync(cwdDir, { recursive: true, force: true });
+	});
+
+	it("falls back to the default list when no config files exist", () => {
+		expect(loadReadOnlyTools(cwdDir, homeDir)).toEqual(DEFAULT_READ_ONLY_TOOLS);
+	});
+
+	it("unions user config into the default list instead of replacing it", () => {
+		fs.mkdirSync(path.join(homeDir, ".pi", "agent"), { recursive: true });
+		fs.writeFileSync(path.join(homeDir, ".pi", "agent", "code-changes.json"), JSON.stringify({ readOnlyTools: ["mcp__docs__*"] }));
+
+		const tools = loadReadOnlyTools(cwdDir, homeDir);
+		expect(tools).toEqual(expect.arrayContaining([...DEFAULT_READ_ONLY_TOOLS, "mcp__docs__*"]));
+	});
+
+	it("unions project config on top of user config and defaults, preserving glob entries", () => {
+		fs.mkdirSync(path.join(homeDir, ".pi", "agent"), { recursive: true });
+		fs.writeFileSync(path.join(homeDir, ".pi", "agent", "code-changes.json"), JSON.stringify({ readOnlyTools: ["mcp__docs__*"] }));
+		fs.mkdirSync(path.join(cwdDir, ".pi"), { recursive: true });
+		fs.writeFileSync(path.join(cwdDir, ".pi", "code-changes.json"), JSON.stringify({ readOnlyTools: ["mcp__notion__*", "web_fetch"] }));
+
+		const tools = loadReadOnlyTools(cwdDir, homeDir);
+		expect(tools).toEqual(expect.arrayContaining([...DEFAULT_READ_ONLY_TOOLS, "mcp__docs__*", "mcp__notion__*"]));
+		// "web_fetch" is already a default, so the union must not duplicate it.
+		expect(tools.filter((t) => t === "web_fetch")).toHaveLength(1);
+	});
+
+	it("ignores invalid JSON instead of throwing", () => {
+		fs.mkdirSync(path.join(cwdDir, ".pi"), { recursive: true });
+		fs.writeFileSync(path.join(cwdDir, ".pi", "code-changes.json"), "{ not json");
+
+		expect(() => loadReadOnlyTools(cwdDir, homeDir)).not.toThrow();
+		expect(loadReadOnlyTools(cwdDir, homeDir)).toEqual(DEFAULT_READ_ONLY_TOOLS);
+	});
+
+	it("ignores a non-array readOnlyTools value", () => {
+		fs.mkdirSync(path.join(cwdDir, ".pi"), { recursive: true });
+		fs.writeFileSync(path.join(cwdDir, ".pi", "code-changes.json"), JSON.stringify({ readOnlyTools: "not-an-array" }));
+
+		expect(loadReadOnlyTools(cwdDir, homeDir)).toEqual(DEFAULT_READ_ONLY_TOOLS);
 	});
 });
 

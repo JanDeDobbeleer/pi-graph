@@ -167,17 +167,24 @@ function pushPolicyLines(state: WorkflowState): string[] {
 	return lines;
 }
 
+const EXTERNAL_CONTEXT_LINE =
+	"Read-only external context is available: `gh` (issue/pr/run/workflow/release view|list, pr diff|checks, repo view, search, label list, read-only api), " +
+	"`curl`/`Invoke-WebRequest` GETs, `git fetch`/`git ls-remote`, and any configured read-only tools (see README's `readOnlyTools`).";
+
 function phaseExtra(state: WorkflowState): string | undefined {
 	switch (state.phase) {
 		case "analyze": {
 			const lines: string[] = [
 				"Edit and write are blocked in this phase. When the analysis report is submitted, a human must approve it (or revise it) before Plan begins.",
+				EXTERNAL_CONTEXT_LINE,
 			];
 			if (state.entry === "issue-triage") {
 				lines.push("This is bare triage: the human may end the run at the approval gate with the analysis itself as the deliverable — no implementation required.");
 			}
 			return lines.join("\n");
 		}
+		case "plan":
+			return EXTERNAL_CONTEXT_LINE;
 		case "delegate":
 			return "Call run_delegation now; it dispatches the plan's tasks.";
 		case "supervise": {

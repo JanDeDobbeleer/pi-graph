@@ -45,7 +45,7 @@ import { cleanupWorktrees, mergedDiff, runDelegation } from "./delegate.ts";
 import { runEscalation } from "./escalate.ts";
 import { decideToolCall, READ_ONLY_PHASES, toolsForPhase, WORKFLOW_TOOLS } from "./gates.ts";
 import { discoverStopHooks, findRepoRoot, formatHookFeedback, hooksBlocked, runStopHooks, StopHookGuard, type StopHook } from "./hooks.ts";
-import { loadTierConfig, modelRef, resolveTierModel, tierForExecutor } from "./models.ts";
+import { loadReadOnlyTools, loadTierConfig, modelRef, resolveTierModel, tierForExecutor } from "./models.ts";
 import { phasePrompt, phaseReminder } from "./prompts.ts";
 import { createResumeTaskTool, escalateSpecGaps, needsSpecGapEscalation, type ResumeDeps } from "./resume.ts";
 import { git, runShell } from "./runner.ts";
@@ -75,6 +75,18 @@ const CI_FIX_CAP = 2;
 
 export default function codeChanges(pi: ExtensionAPI): void {
 	let state: WorkflowState | undefined;
+
+	// -------------------------------------------------------------------------
+	// Extra read-only tools (from other extensions) activated in Analyze/Plan/Supervise/Verify.
+	// Loaded once per session_start and refreshed on every /change start, same caching pattern as
+	// the stop-hooks discovery below.
+	// -------------------------------------------------------------------------
+
+	let extraReadOnlyTools: string[] = [];
+
+	function refreshReadOnlyTools(cwd: string): void {
+		extraReadOnlyTools = loadReadOnlyTools(cwd);
+	}
 
 	// -------------------------------------------------------------------------
 	// "code-changes-analysis" messages render as Markdown in the transcript. pi supplies
@@ -136,7 +148,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			pi.setActiveTools(current.baselineTools);
 		} else {
 			const registered = pi.getAllTools().map((t) => t.name);
-			pi.setActiveTools(toolsForPhase(current.phase, registered));
+			pi.setActiveTools(toolsForPhase(current.phase, registered, extraReadOnlyTools));
 		}
 	}
 
@@ -537,6 +549,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		}
 
 		await discoverHooks(ctx.cwd, true);
+		refreshReadOnlyTools(ctx.cwd);
 
 		const baseRefResult = await git(["rev-parse", "HEAD"], ctx.cwd);
 		const baseRef = baseRefResult.code === 0 ? baseRefResult.stdout.trim() : undefined;
@@ -1065,7 +1078,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	// -------------------------------------------------------------------------
 
 	pi.on("tool_call", async (event): Promise<ToolCallEventResult | undefined> => {
-		const decision = decideToolCall(state, event.toolName, event.input as Record<string, unknown>);
+		const decision = decideToolCall(state, event.toolName, event.input as Record<string, unknown>, extraReadOnlyTools);
 		if (decision) return { block: true, reason: decision.reason };
 		return undefined;
 	});
@@ -1188,6 +1201,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		hooksDiscovered = false;
 		stopHookGuard.reset();
 		await discoverHooks(ctx.cwd);
+		refreshReadOnlyTools(ctx.cwd);
 		if (isActive(state)) {
 			// A finished (done/stopped) run must not overwrite the user's current tools on every
 			// session start; only an in-progress run's phase tools should apply.
