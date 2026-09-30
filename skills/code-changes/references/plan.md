@@ -34,6 +34,12 @@ Write the spec down before delegating anything. It contains:
   independent ones; sequence the rest. When in doubt, sequence — a merge conflict between two
   parallel subagents costs more than the parallelism saves.
 - Documentation updates belong to the task that changes the behavior, not to a separate task.
+- Give each task the `paths` it may change: folders (`src/segments/`), files, or globs
+  (`src/**/*_test.go`). Keep independent tasks' paths disjoint; the harness runs non-overlapping
+  independent tasks in parallel, each in its own worktree.
+<!-- harness:enforced -->
+  Independent tasks whose paths overlap are rejected: add a dependency between them or merge them.
+<!-- /harness:enforced -->
 
 ## Decide the workspace per task
 
@@ -47,8 +53,8 @@ Write the spec down before delegating anything. It contains:
 When any tasks run in parallel worktrees, name the integration step now, before delegating:
 
 <!-- harness:enforced -->
-- The order branches merge back (`merge_plan.order`) is required whenever more than one task runs
-  in a worktree.
+- The order branches merge back (`merge_plan.order`) is optional (plan order is the default); when
+  given, it must list exactly the tasks that end up in worktrees.
 <!-- /harness:enforced -->
 - Who executes that merge and resolves any conflict it surfaces: the coordinator, at integration
   time in Phase 4 — never an implementer, since an isolated worktree branch never sees another
@@ -63,7 +69,7 @@ When any tasks run in parallel worktrees, name the integration step now, before 
 ## Output of this phase
 
 A task list where each entry names its executor tier (see Phase 3), its workspace, its
-dependencies, and carries its pinned spec.
+dependencies, the paths it may change, and carries its pinned spec.
 <!-- /harness:enforced -->
 
 <!-- harness:enforced -->

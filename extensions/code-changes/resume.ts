@@ -14,7 +14,20 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { commitWorktree, DEFAULT_TASK_TIMEOUT_MS, IMPLEMENTER_SYSTEM_PROMPT, parseSpecGaps, runPiAgent } from "./delegate.ts";
+import {
+	changedFilesSince,
+	commitWorktree,
+	DEFAULT_TASK_TIMEOUT_MS,
+	deriveWorktreeBase,
+	IMPLEMENTER_SYSTEM_PROMPT,
+	mainTreeChangesSince,
+	outOfScopeFiles,
+	parseSpecGaps,
+	recordScope,
+	runPiAgent,
+	snapshotMainTree,
+	type MainTreeSnapshot,
+} from "./delegate.ts";
 import { git } from "./runner.ts";
 import { isActive, type Escalation, type ExecutorTier, type TaskRun, type WorkflowState } from "./state.ts";
 
@@ -158,6 +171,8 @@ export function createResumeTaskTool(deps: ResumeDeps): ToolDefinition<typeof Re
 				beforeHead = headResult.code === 0 ? headResult.stdout.trim() : undefined;
 			}
 
+			const mainBefore: MainTreeSnapshot | undefined = isWorktree ? undefined : await snapshotMainTree(workDir, signal);
+
 			onUpdate?.({ content: [{ type: "text", text: `Resuming task ${params.task_id}...` }], details: { run } });
 
 			const result = await runAgent({
@@ -178,6 +193,20 @@ export function createResumeTaskTool(deps: ResumeDeps): ToolDefinition<typeof Re
 				stalled: result.timedOut,
 				resumes,
 			};
+
+			// Recompute the scope check. A worktree's whole diff against its starting commit is still
+			// available; for the main tree only this resume's changes are, so earlier violations that are
+			// still dirty are kept.
+			if (isWorktree) {
+				const base = await deriveWorktreeBase(workDir, ctx.cwd, signal);
+				const files = base ? await changedFilesSince(workDir, base, signal) : [];
+				recordScope(updatedRun, base ? outOfScopeFiles(files, task) : (run.out_of_scope ?? []));
+			} else if (mainBefore) {
+				const changed = await mainTreeChangesSince(workDir, mainBefore, signal);
+				const stillDirty = new Set(await changedFilesSince(workDir, "HEAD", signal));
+				const carried = (run.out_of_scope ?? []).filter((f) => stillDirty.has(f));
+				recordScope(updatedRun, [...new Set([...carried, ...outOfScopeFiles(changed, task)])].sort());
+			}
 
 			if (result.timedOut) {
 				updatedRun.status = "failed";

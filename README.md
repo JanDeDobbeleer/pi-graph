@@ -110,6 +110,9 @@ read them. The analysis, final report, hook failures and CI failures always rend
 | State survives resume/fork | `pi.appendEntry(STATE_ENTRY, state)` on every transition, restored on `session_start` |
 | Push, PR creation, and PR/issue replies are blocked unless allowed | `WorkflowState.pushAllowed` (set by `--push` at start or `/change allow-push` mid-run), enforced in `gates.ts`/`delivery` |
 | Staging must be explicit | `git add -A` / `git add .` / `git commit -a` are rejected by `isReadOnlyCommand`'s sibling staging check in `gates.ts` |
+| Every sub-agent task declares the `paths` it may change, and independent tasks may not overlap | `validatePlan` in `artifacts.ts` rejects a plan where a trivial/implementer task has no `paths`, where a path is absolute or contains `..`, or where two independent (no transitive dependency either way) sub-agent tasks have overlapping paths (`paths.ts`); coordinator-direct tasks run later in Supervise and are exempt |
+| Independent tasks with disjoint paths run in parallel, decided by the harness | `effectiveWorkspace` (`planning.ts`) moves such "main" tasks into worktrees; `runDelegation` runs them concurrently, capped by `maxParallel` |
+| An implementer that strays outside its declared paths is flagged | after every implementer run `delegate.ts` diffs the changed files against the task's `paths`; strays land in `TaskRun.out_of_scope` and as a spec-gap line (so a repeat escalates), and Supervise's prompt lists them |
 | A repeated implementer spec gap escalates automatically | `TaskRun.spec_gaps` count tracked in `state.ts`/`delegate.ts`; a second `SPEC GAP:` on the same task triggers `escalate.ts` without waiting for Supervise to ask |
 | A stalled implementer is killed and surfaced, not left hanging | per-task time budget enforced in `delegate.ts`; `TaskRun.stalled` flips true and Supervise is prompted to `resume_task` |
 
@@ -134,7 +137,7 @@ has to apply. What's wrapped, per file, and what enforces it:
 | Reference file | Wrapped | Enforced by |
 |---|---|---|
 | `analyze.md` | "Output of this phase" (the schema is a tool now), "Stop gate" | `AnalysisSchema` in `artifacts.ts`; the `agent_end` approval gate in `index.ts` |
-| `plan.md` | "Output of this phase"; the `merge_plan`-required and once-on-merged-state parts of "Plan the merge" | `PlanSchema`/`validatePlan` in `artifacts.ts` |
+| `plan.md` | "Output of this phase"; the once-on-merged-state part of "Plan the merge"; the "overlapping independent tasks are rejected" sentence of the `paths` bullet (the rest of that bullet, the `merge_plan` guidance, and the workspace decision stay visible) | `PlanSchema`/`validatePlan` in `artifacts.ts` |
 | `delegate.md` | Everything except the executor-tier bullets (which tier fits which task, "delegate anyway when there's real parallelism") | Tier choice is still a Plan-time judgment call; the rest (what a delegation carries, what's never delegated downward) is standing instructions the harness already sends (`STANDING_INSTRUCTIONS` in `artifacts.ts`) or enforces via `PHASE_TOOLS` |
 | `supervise.md` | "Integrate before reviewing" | `delegate.ts`'s squash-merge per `merge_plan`; only an actual conflict is left for the model to resolve |
 | `verify.md` | "Retry cap"; the routing half of "On failure" (the → destination, not the gate-failure/spec-mismatch/wrong-root-cause definitions, which the model still classifies) | `state.failures`/`applyVerification` in `artifacts.ts` |
@@ -253,13 +256,17 @@ Configure per-tier models in `~/.pi/agent/code-changes.json` (personal) or `.pi/
     "implementer": "anthropic/claude-sonnet-5",
     "trivial": "anthropic/claude-haiku-4-5"
   },
-  "readOnlyTools": ["mcp__docs__*"]
+  "readOnlyTools": ["mcp__docs__*"],
+  "maxParallel": 4
 }
 ```
 
 Defaults (from `models.ts`) are shown above. `"session"` (or omitting a tier) keeps whatever model
 the session is already using instead of switching. An unresolvable model reference falls back to
 the current model and triggers a one-time warning.
+
+`maxParallel` (integer 1..16, default 4; the project file wins over the user file, invalid values
+are ignored) caps how many implementer processes run at the same time during Delegate.
 
 `readOnlyTools` names (glob patterns with `*` allowed) other registered extensions' read-only tools
 — web fetch/search, MCP documentation bridges, and similar — that should be activated on top of the
@@ -270,17 +277,54 @@ config both add to that list rather than replacing it, and an entry that names `
 `bash`, `powershell`, or any workflow tool is ignored so it can never widen what a read-only phase
 can actually do.
 
+## Parallel delegation
+
+The harness, not the model, decides which tasks run in parallel.
+
+- **`paths`**: every trivial/implementer task in the plan lists the repo-relative folders, files or
+  globs it may change (`"src/segments/"`, `"website/docs/segments/cloud/gcp.mdx"`,
+  `"src/**/*_test.go"`; `/` separators, Windows `\` is normalized). Absolute, drive-letter and `..`
+  paths are rejected. Coordinator-direct tasks may omit them.
+- **Overlap rule**: two tasks that are *independent* (neither transitively depends on the other) must
+  not be able to change the same files. The check is conservative: equal patterns, a directory and
+  anything under it, and globs whose static prefix (up to the first glob character, cut at the last
+  `/`) is prefix-related all count as overlapping; `**`, `.` and an empty pattern mean everything.
+  `src/a` and `src/ab` are siblings, not overlapping. An overlapping pair is rejected at
+  `submit_plan` (and when the human edits the plan): add a dependency between the tasks or merge them.
+- **Auto-worktree**: a task the plan leaves in the `main` workspace is moved into a git worktree
+  (`effectiveWorkspace`) when it shares a dependency wave with at least one independent sub-agent
+  task and does not set `requires_main_tree`. A task that depends on a moved task is moved along with
+  it, so its worktree can merge those branches in; a task that (transitively) feeds a
+  `requires_main_tree` task stays in the main tree. Moved runs have `TaskRun.auto_worktree = true`
+  and a line in the merge log (`task X moved to a worktree to run in parallel with Y`). The plan
+  approval view shows a **Parallelism** section (waves, which tasks run together, which move).
+- **`requires_main_tree`**: set it only when a task needs the uncommitted changes in the main tree;
+  worktrees branch from `HEAD` and do not see them. It is never moved.
+- **`merge_plan`** is optional. Since the harness decides the final workspaces, when it is omitted the
+  worktree branches are merged in plan order. When present, `merge_plan.order` must list exactly the
+  tasks that end up in worktrees (computed with the same `effectiveWorkspace`), and `conflict_owner`
+  must be non-empty.
+- **Concurrency cap**: at most `maxParallel` (default 4) implementer processes run at once. The
+  main-tree tasks of a wave run one after another and count as one slot.
+- **Scope check**: after each implementer run the harness lists the files it changed. For a
+  worktree, that is everything since the commit the worktree's own work started from (committed,
+  staged, unstaged and untracked). For the main tree, it is the files that are new or changed
+  compared with a snapshot taken just before the run, so files that were already dirty do not count.
+  Files not matching the task's `paths` go into `TaskRun.out_of_scope` and one spec-gap line,
+  `changed files outside its declared paths: a, b`. The run is not failed. `resume_task` recomputes
+  the check.
+
 ## Delegation details
 
 - Each worktree task gets its own `git worktree add -b pi-cc/<run-id>/<task-id> <path> HEAD`, in the
   OS temp dir.
-- Tasks run wave-by-wave by dependency order: worktree tasks in a wave run in parallel, main-tree
-  tasks in a wave run sequentially in the main working tree.
+- Tasks run wave-by-wave by dependency order: worktree tasks in a wave run in parallel (up to
+  `maxParallel`), main-tree tasks in a wave run sequentially in the main working tree.
 - Each dispatched task runs in a fresh, session-less child `pi` process (`--no-extensions
   --no-session --mode json`), so it never re-loads this extension or any other project extension.
 - After every wave, successful worktree branches are squash-merged back into the main tree in
   `merge_plan.order` (or plan order), stopping at the first conflict so Supervise can resolve it.
-- Worktrees are removed on `/change abort`, `/change cleanup`, and successful delivery — not
+- Worktrees are removed on `/change abort`, `/change cleanup`, and successful delivery - not
   automatically at any other point, so a failed run can still be inspected.
 
 ## Known limits
@@ -289,10 +333,13 @@ can actually do.
   it to run builds, tests, and git. Only Analyze/Plan/Delegate are hard-gated to read-only, and only
   `edit`/`write` are blocked outright in Analyze. A model can still misuse bash to write files in
   the later phases — the gate is a strong deterrent and an audit trail, not a sandbox.
-- A main-tree task that depends on a worktree task only sees that dependency's changes after the
-  final merge step (once every wave has run), because worktree branches only land in the main tree
-  at the end. Plan tasks accordingly, or put both in the same workspace when one needs to see the
-  other's files mid-run.
+- A main-tree task that depends on a worktree task you declared (`workspace: "worktree"`) only sees
+  that dependency's changes after the final merge step (once every wave has run), because worktree
+  branches only land in the main tree at the end. Plan tasks accordingly, or put both in the same
+  workspace when one needs to see the other's files mid-run. (Tasks the harness moves itself are
+  handled: their dependents move with them.)
+- The overlap check compares declared `paths`; it cannot know what an implementer actually edits.
+  The scope check flags strays after the fact, and a real conflict still surfaces at merge time.
 
 ## Development
 
@@ -302,7 +349,7 @@ npm test
 npm run typecheck
 ```
 
-The extension's logic lives in `extensions/code-changes/{state,artifacts,gates,models,escalate,runner,delegate,hooks,ci}.ts`
+The extension's logic lives in `extensions/code-changes/{state,artifacts,paths,planning,gates,models,escalate,runner,delegate,hooks,ci}.ts`
 (pure functions, unit-tested) with `index.ts` and `prompts.ts` as the pi-facing glue. The bundled
 skill (`skills/code-changes/`) is a copy of the oh-my-posh `code-changes` skill and works standalone
 without this extension, describing the same workflow in Markdown for agents that don't load pi

@@ -49,7 +49,7 @@ import { cleanupWorktrees, mergedDiff, runDelegation } from "./delegate.ts";
 import { runEscalation } from "./escalate.ts";
 import { decideToolCall, READ_ONLY_PHASES, toolsForPhase, WORKFLOW_TOOLS } from "./gates.ts";
 import { discoverStopHooks, findRepoRoot, formatHookFeedback, hooksBlocked, runStopHooks, StopHookGuard, type StopHook } from "./hooks.ts";
-import { loadReadOnlyTools, loadTierConfig, modelRef, resolveTierModel, tierForExecutor } from "./models.ts";
+import { loadMaxParallel, loadReadOnlyTools, loadTierConfig, modelRef, resolveTierModel, tierForExecutor } from "./models.ts";
 import { phasePrompt, phaseReminder } from "./prompts.ts";
 import { createResumeTaskTool, escalateSpecGaps, needsSpecGapEscalation, type ResumeDeps } from "./resume.ts";
 import { isTransientProviderError, MAX_TRANSIENT_RETRIES, retryBackoff } from "./retry.ts";
@@ -920,7 +920,8 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "submit_plan",
 		label: "Submit plan",
-		description: "Submit the task list (and merge_plan, if more than one worktree task) to end the Plan phase.",
+		description:
+			"Submit the task list to end the Plan phase. Every sub-agent task needs `paths`; independent tasks with overlapping paths are rejected. merge_plan is optional.",
 		parameters: PlanSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!state || state.phase !== "plan") {
@@ -946,7 +947,8 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "run_delegation",
 		label: "Run delegation",
-		description: "Dispatch the plan's tasks to sub-agents (worktrees in parallel, main-tree tasks sequentially), then merge worktree branches back in.",
+		description:
+			"Dispatch the plan's tasks to sub-agents (independent tasks with non-overlapping paths run in parallel in worktrees, capped by maxParallel; the rest run in the main tree), then merge worktree branches back in.",
 		parameters: Type.Object({}),
 		executionMode: "sequential",
 		async execute(_toolCallId, _params, signal, onUpdate, ctx) {
@@ -965,6 +967,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 				runId: capturedState.id,
 				resolveModel: (tier) => resolveTierModel(ctx.modelRegistry, config, tierForExecutor(tier), undefined).ref,
 				signal,
+				maxParallel: loadMaxParallel(ctx.cwd),
 				onProgress: (progress) => {
 					if (!state) return;
 					state = { ...state, runs: progress };

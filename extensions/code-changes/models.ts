@@ -8,6 +8,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_PARALLEL } from "./delegate.ts";
 import type { ExecutorTier, Tier } from "./state.ts";
 
 /** "provider/modelId" strings. "session" (or undefined for coordinator) keeps the current session model. */
@@ -32,6 +33,7 @@ export const DEFAULT_READ_ONLY_TOOLS: string[] = ["web_fetch", "webfetch", "fetc
 interface CodeChangesConfig {
 	tiers?: TierConfig;
 	readOnlyTools?: unknown;
+	maxParallel?: unknown;
 }
 
 function readConfigFile(file: string): CodeChangesConfig | undefined {
@@ -87,6 +89,22 @@ export function loadReadOnlyTools(cwd: string, home: string = os.homedir()): str
 		...normalizeToolNames(projectConfig?.readOnlyTools),
 	]);
 	return [...merged];
+}
+
+export { DEFAULT_MAX_PARALLEL };
+
+function validMaxParallel(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 16 ? value : undefined;
+}
+
+/**
+ * `maxParallel` (an integer 1..16, default 4) from ~/.pi/agent/code-changes.json, overridden by
+ * <cwd>/.pi/code-changes.json. Missing, invalid or out-of-range values are ignored, never thrown.
+ */
+export function loadMaxParallel(cwd: string, home: string = os.homedir()): number {
+	const userConfig = readConfigFile(userConfigPath(home));
+	const projectConfig = readConfigFile(projectConfigPath(cwd));
+	return validMaxParallel(projectConfig?.maxParallel) ?? validMaxParallel(userConfig?.maxParallel) ?? DEFAULT_MAX_PARALLEL;
 }
 
 export function parseModelRef(ref: string): { provider: string; id: string } | undefined {

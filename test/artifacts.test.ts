@@ -47,6 +47,7 @@ function task(overrides: Partial<PlanTask> = {}): PlanTask {
 		executor_tier: "implementer",
 		workspace: "main",
 		dependencies: [],
+		paths: [`src/${overrides.id ?? "t1"}/`],
 		...overrides,
 	};
 }
@@ -207,11 +208,94 @@ describe("validatePlan", () => {
 		expect(validatePlan(plan).some((p) => /cycle/i.test(p))).toBe(true);
 	});
 
-	it("requires merge_plan when more than one worktree task exists", () => {
+	it("does not require merge_plan when more than one worktree task exists", () => {
 		const plan: PlanParams = {
 			tasks: [task({ id: "a", workspace: "worktree" }), task({ id: "b", workspace: "worktree" })],
 		};
-		expect(validatePlan(plan).some((p) => /merge_plan is required/i.test(p))).toBe(true);
+		expect(validatePlan(plan)).toEqual([]);
+	});
+
+	it("rejects a merge_plan that omits a task the harness moves to a worktree", () => {
+		// a and b are independent "main" tasks in different folders: both end up in worktrees.
+		const plan: PlanParams = {
+			tasks: [task({ id: "a" }), task({ id: "b" })],
+			merge_plan: { order: ["a"], conflict_owner: "coordinator" },
+		};
+		const problems = validatePlan(plan);
+		expect(problems.some((p) => /missing worktree task\(s\): b/.test(p))).toBe(true);
+		expect(validatePlan({ ...plan, merge_plan: { order: ["a", "b"], conflict_owner: "coordinator" } })).toEqual([]);
+	});
+
+	it("rejects a merge_plan that lists a task that stays in the main tree", () => {
+		const plan: PlanParams = {
+			tasks: [task({ id: "a" }), task({ id: "b", requires_main_tree: true })],
+			merge_plan: { order: ["a", "b"], conflict_owner: "coordinator" },
+		};
+		expect(validatePlan(plan).some((p) => /non-worktree task\(s\): b/.test(p))).toBe(true);
+	});
+
+	it("rejects independent sub-agent tasks whose paths overlap", () => {
+		const plan: PlanParams = {
+			tasks: [task({ id: "a", paths: ["src/segments/"] }), task({ id: "b", paths: ["src/segments/gcp.go"] })],
+		};
+		const problems = validatePlan(plan);
+		expect(problems).toHaveLength(1);
+		expect(problems[0]).toMatch(/tasks a and b may change the same files/);
+		expect(problems[0]).toMatch(/add a dependency between them or merge them/);
+	});
+
+	it("accepts overlapping paths once one task depends on the other", () => {
+		const plan: PlanParams = {
+			tasks: [
+				task({ id: "a", paths: ["src/segments/"] }),
+				task({ id: "b", paths: ["src/segments/gcp.go"], dependencies: ["a"] }),
+			],
+		};
+		expect(validatePlan(plan)).toEqual([]);
+	});
+
+	it("treats a transitive dependency as ordering too", () => {
+		const plan: PlanParams = {
+			tasks: [
+				task({ id: "a", paths: ["src/"] }),
+				task({ id: "b", paths: ["docs/"], dependencies: ["a"] }),
+				task({ id: "c", paths: ["src/x.go"], dependencies: ["b"] }),
+			],
+		};
+		expect(validatePlan(plan)).toEqual([]);
+	});
+
+	it("exempts coordinator-direct tasks from the overlap check and from needing paths", () => {
+		const plan: PlanParams = {
+			tasks: [
+				task({ id: "a", paths: ["src/"] }),
+				task({ id: "b", executor_tier: "coordinator-direct", paths: ["src/"] }),
+				task({ id: "c", executor_tier: "coordinator-direct", paths: undefined }),
+			],
+		};
+		expect(validatePlan(plan)).toEqual([]);
+	});
+
+	it("requires paths on trivial and implementer tasks", () => {
+		for (const executor_tier of ["trivial", "implementer"] as const) {
+			const problems = validatePlan({ tasks: [task({ id: "a", executor_tier, paths: undefined })] });
+			expect(problems.some((p) => /Task "a" has no paths/.test(p))).toBe(true);
+		}
+		expect(validatePlan({ tasks: [task({ id: "a", paths: [] })] }).some((p) => /has no paths/.test(p))).toBe(true);
+	});
+
+	it("rejects absolute, drive, parent-relative and empty paths", () => {
+		for (const bad of ["/etc/passwd", "\\share\\x", "C:\\repo\\src", "c:/repo", "../other", "src/../../x", "", "  "]) {
+			const problems = validatePlan({ tasks: [task({ paths: [bad] })] });
+			expect(problems.some((p) => /invalid path/.test(p)), `path ${JSON.stringify(bad)}`).toBe(true);
+		}
+	});
+
+	it("accepts relative folders, files, globs and Windows separators", () => {
+		const plan: PlanParams = {
+			tasks: [task({ paths: ["src/segments/", "website\\docs\\gcp.mdx", "src/**/*_test.go", "./README.md"] })],
+		};
+		expect(validatePlan(plan)).toEqual([]);
 	});
 
 	it("accepts two worktree tasks with a valid merge_plan", () => {
@@ -267,6 +351,32 @@ describe("formatPlan / planToEditable / parseEditablePlan", () => {
 		expect(md).toContain("t0");
 		expect(md).toContain("do the work");
 		expect(md).toContain("npm test");
+	});
+
+	it("formatPlan shows paths, requires_main_tree and a Parallelism section", () => {
+		const p = plan({
+			tasks: [
+				task({ id: "a", paths: ["src/a/"] }),
+				task({ id: "b", paths: ["src/b/", "docs/b.md"] }),
+				task({ id: "c", paths: ["src/c/"], requires_main_tree: true, dependencies: ["a"] }),
+				task({ id: "d", executor_tier: "coordinator-direct", paths: undefined, dependencies: ["c"] }),
+			],
+		});
+		const md = formatPlan(p);
+		expect(md).toContain("- paths: src/a/");
+		expect(md).toContain("- paths: src/b/, docs/b.md");
+		expect(md).toContain("requires main tree");
+		expect(md).toContain("## Parallelism");
+		// a and b are independent in wave 1, c is pinned to the main tree so a cannot move (it must be visible to c).
+		expect(md).toMatch(/Wave 1: a \(main\), b \(worktree, moved from main\)/);
+		expect(md).toContain("b moves to a worktree to run in parallel with a");
+		expect(md).toContain("coordinator-direct, run in Supervise: d");
+	});
+
+	it("formatPlan lists parallel worktree tasks and the default merge order", () => {
+		const md = formatPlan(plan({ tasks: [task({ id: "a" }), task({ id: "b" })] }));
+		expect(md).toMatch(/Wave 1: a \(worktree, moved from main\), b \(worktree, moved from main\) -- run in parallel/);
+		expect(md).toContain("a -> b");
 	});
 
 	it("formatPlan includes the merge plan when present", () => {

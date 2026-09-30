@@ -1,6 +1,8 @@
 /**
  * Delegate phase: fan a plan's tasks out to sub-agent `pi` processes (worktree tasks in
- * parallel, main-tree tasks sequentially), then fan the worktree branches back in.
+ * parallel, main-tree tasks sequentially), then fan the worktree branches back in. Which tasks
+ * end up in worktrees is decided by `effectiveWorkspace` (planning.ts): independent tasks with
+ * disjoint `paths` are moved there automatically so they can run concurrently, up to `maxParallel`.
  *
  * The sub-agent spawning pattern (spawn `pi --mode json -p --no-session ...`, parse JSON-lines
  * events for `message_end`, collect the final assistant text and usage) is adapted from
@@ -22,8 +24,12 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { matchesAnyPath, normalizePath } from "./paths.ts";
+import { effectiveWorkspace, isSubAgentTask, planWorkspaces, topologicalWaves, type WorkspaceDecision } from "./planning.ts";
 import { git } from "./runner.ts";
 import type { DelegationPacket, ExecutorTier, PlanTask, TaskList, TaskRun } from "./state.ts";
+
+export { effectiveWorkspace };
 
 // ---------------------------------------------------------------------------
 // Sub-agent process spawning
@@ -234,25 +240,8 @@ export async function runPiAgent(opts: RunPiAgentOptions): Promise<RunPiAgentRes
 // Dependency ordering
 // ---------------------------------------------------------------------------
 
-/** Groups tasks into dependency waves (Kahn's algorithm, layered). Throws on a cycle. */
-export function topoWaves(tasks: PlanTask[]): PlanTask[][] {
-	const byId = new Map(tasks.map((t) => [t.id, t]));
-	const waves: PlanTask[][] = [];
-	const done = new Set<string>();
-	let remaining = tasks.slice();
-
-	while (remaining.length > 0) {
-		const ready = remaining.filter((t) => t.dependencies.every((d) => done.has(d) || !byId.has(d)));
-		if (ready.length === 0) {
-			throw new Error(`Cycle detected in task dependencies: ${remaining.map((t) => t.id).join(", ")}`);
-		}
-		waves.push(ready);
-		for (const t of ready) done.add(t.id);
-		const readyIds = new Set(ready.map((t) => t.id));
-		remaining = remaining.filter((t) => !readyIds.has(t.id));
-	}
-	return waves;
-}
+/** Groups tasks into dependency waves. Throws on a cycle. Same implementation as `topologicalWaves`. */
+export const topoWaves = topologicalWaves;
 
 // ---------------------------------------------------------------------------
 // Delegation
@@ -269,7 +258,11 @@ export interface DelegateDeps {
 	runAgent?: typeof runPiAgent;
 	/** Per-task time budget passed to `runPiAgent`. Defaults to `DEFAULT_TASK_TIMEOUT_MS`. */
 	taskTimeoutMs?: number;
+	/** Cap on concurrently running implementer processes (worktree tasks and the main-tree chain). Defaults to 4. */
+	maxParallel?: number;
 }
+
+export const DEFAULT_MAX_PARALLEL = 4;
 
 export const IMPLEMENTER_SYSTEM_PROMPT = [
 	"You are an implementer executing one pinned task from a larger plan.",
@@ -309,6 +302,133 @@ export async function commitWorktree(worktree: string, taskId: string, message?:
 	return { committed: true, head: headResult.code === 0 ? headResult.stdout.trim() : undefined };
 }
 
+// ---------------------------------------------------------------------------
+// Scope check: did the implementer stay inside the task's declared `paths`?
+// ---------------------------------------------------------------------------
+
+/** Prefix of the spec-gap line recorded for a run that changed files outside its declared paths. */
+export const SCOPE_GAP_PREFIX = "changed files outside its declared paths:";
+
+async function gitLines(args: string[], cwd: string, signal?: AbortSignal): Promise<string[]> {
+	const result = await git(["-c", "core.quotepath=false", ...args], cwd, signal);
+	if (result.code !== 0) return [];
+	return result.stdout
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0)
+		.map(normalizePath);
+}
+
+/** Files that differ from `base` in `dir`'s working tree (committed, staged or unstaged), plus untracked files. Repo-relative. */
+export async function changedFilesSince(dir: string, base: string, signal?: AbortSignal): Promise<string[]> {
+	const [tracked, untracked] = await Promise.all([
+		gitLines(["diff", "--name-only", "--no-renames", base], dir, signal),
+		gitLines(["ls-files", "--others", "--exclude-standard", "--full-name"], dir, signal),
+	]);
+	return [...new Set([...tracked, ...untracked])].sort();
+}
+
+/** Dirty-file snapshot of the main tree (name -> size:mtime), taken before a main-tree implementer runs. */
+export type MainTreeSnapshot = Map<string, string>;
+
+export async function snapshotMainTree(cwd: string, signal?: AbortSignal): Promise<MainTreeSnapshot> {
+	const rootResult = await git(["rev-parse", "--show-toplevel"], cwd, signal);
+	const root = rootResult.code === 0 && rootResult.stdout.trim() ? rootResult.stdout.trim() : cwd;
+	const snapshot: MainTreeSnapshot = new Map();
+	for (const file of await changedFilesSince(cwd, "HEAD", signal)) {
+		try {
+			const stat = await fs.promises.stat(path.join(root, file));
+			snapshot.set(file, `${stat.size}:${stat.mtimeMs}`);
+		} catch {
+			snapshot.set(file, "missing");
+		}
+	}
+	return snapshot;
+}
+
+/** Files that are new, newly modified, or no longer dirty compared with `before`. */
+export async function mainTreeChangesSince(cwd: string, before: MainTreeSnapshot, signal?: AbortSignal): Promise<string[]> {
+	const after = await snapshotMainTree(cwd, signal);
+	const changed = new Set<string>();
+	for (const [file, signature] of after) {
+		if (before.get(file) !== signature) changed.add(file);
+	}
+	for (const file of before.keys()) {
+		if (!after.has(file)) changed.add(file);
+	}
+	return [...changed].sort();
+}
+
+/**
+ * The commit a worktree's own work started from: the latest dependency-merge commit on its branch
+ * (changes brought in by earlier tasks are not this task's), else the fork point from the main tree's HEAD.
+ */
+export async function deriveWorktreeBase(worktree: string, mainCwd: string, signal?: AbortSignal): Promise<string | undefined> {
+	const mainHead = await git(["rev-parse", "HEAD"], mainCwd, signal);
+	if (mainHead.code !== 0) return undefined;
+	const head = mainHead.stdout.trim();
+	const merges = await git(["rev-list", "--merges", "-n", "1", "HEAD", `^${head}`], worktree, signal);
+	if (merges.code === 0 && merges.stdout.trim()) return merges.stdout.trim();
+	const forkPoint = await git(["merge-base", "HEAD", head], worktree, signal);
+	return forkPoint.code === 0 && forkPoint.stdout.trim() ? forkPoint.stdout.trim() : undefined;
+}
+
+/** The changed files that fall outside `task.paths` (none when the task declares no paths). */
+export function outOfScopeFiles(files: string[], task: PlanTask): string[] {
+	if (!task.paths || task.paths.length === 0) return [];
+	return files.filter((file) => !matchesAnyPath(file, task.paths as string[]));
+}
+
+/** Records the scope-check result on a run: `out_of_scope`, plus one (replaced, not duplicated) spec-gap line. */
+export function recordScope(run: TaskRun, outOfScope: string[]): void {
+	const gaps = (run.spec_gaps ?? []).filter((gap) => !gap.startsWith(SCOPE_GAP_PREFIX));
+	if (outOfScope.length > 0) {
+		run.out_of_scope = outOfScope;
+		gaps.push(`${SCOPE_GAP_PREFIX} ${outOfScope.join(", ")}`);
+	} else {
+		run.out_of_scope = undefined;
+	}
+	run.spec_gaps = gaps;
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency helpers
+// ---------------------------------------------------------------------------
+
+/** Minimal counting semaphore: caps concurrent implementer processes without extra dependencies. */
+class Semaphore {
+	private free: number;
+	private waiters: Array<() => void> = [];
+
+	constructor(count: number) {
+		this.free = count;
+	}
+
+	async acquire(): Promise<() => void> {
+		if (this.free > 0) {
+			this.free -= 1;
+		} else {
+			await new Promise<void>((resolve) => this.waiters.push(resolve));
+		}
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			const next = this.waiters.shift();
+			if (next) next();
+			else this.free += 1;
+		};
+	}
+}
+
+/** `git worktree add` writes shared refs; run those one at a time even when the tasks themselves run in parallel. */
+let worktreeAddQueue: Promise<unknown> = Promise.resolve();
+function serializeWorktreeAdd<T>(fn: () => Promise<T>): Promise<T> {
+	const result = worktreeAddQueue.then(fn, fn);
+	worktreeAddQueue = result.catch(() => undefined);
+	return result;
+}
+
 function buildTaskPrompt(spec: string, verificationCommands: string[], standingInstructions: string): string {
 	const verificationBlock =
 		verificationCommands.length > 0 ? verificationCommands.map((c) => `- ${c}`).join("\n") : "- (none specified)";
@@ -336,6 +456,7 @@ async function runWorktreeTask(
 	run: TaskRun,
 	deps: DelegateDeps,
 	plan: TaskList,
+	decisions: Map<string, WorkspaceDecision>,
 	allRuns: TaskRun[],
 	notify: () => void,
 ): Promise<void> {
@@ -347,7 +468,7 @@ async function runWorktreeTask(
 	const worktreePath = path.join(os.tmpdir(), "pi-cc", `${deps.runId}-${sanitized}`);
 
 	await fs.promises.mkdir(path.dirname(worktreePath), { recursive: true });
-	const addResult = await git(["worktree", "add", "-b", branch, worktreePath, "HEAD"], deps.cwd, deps.signal);
+	const addResult = await serializeWorktreeAdd(() => git(["worktree", "add", "-b", branch, worktreePath, "HEAD"], deps.cwd, deps.signal));
 	if (addResult.code !== 0) {
 		run.status = "failed";
 		run.error = `git worktree add failed: ${tail(addResult.stderr || addResult.stdout)}`;
@@ -361,7 +482,7 @@ async function runWorktreeTask(
 	// and never saw them otherwise (see module doc comment).
 	for (const depId of task.dependencies) {
 		const depTask = plan.tasks.find((t) => t.id === depId);
-		if (!depTask || depTask.workspace !== "worktree") continue;
+		if (!depTask || decisions.get(depTask.id)?.workspace !== "worktree") continue;
 		const depRun = allRuns.find((r) => r.task_id === depId);
 		if (!depRun || depRun.status !== "succeeded" || !depRun.branch) continue;
 		const mergeResult = await git(["merge", "--no-edit", depRun.branch], worktreePath, deps.signal);
@@ -372,6 +493,10 @@ async function runWorktreeTask(
 			return;
 		}
 	}
+
+	// Everything up to here (including merged dependency branches) is not this task's work.
+	const baseResult = await git(["rev-parse", "HEAD"], worktreePath, deps.signal);
+	const base = baseResult.code === 0 ? baseResult.stdout.trim() : undefined;
 
 	const model = deps.resolveModel(task.executor_tier);
 	const runAgent = deps.runAgent ?? runPiAgent;
@@ -388,6 +513,7 @@ async function runWorktreeTask(
 	run.report = result.text;
 	run.spec_gaps = [...(run.spec_gaps ?? []), ...parseSpecGaps(result.text)];
 	run.stalled = result.timedOut;
+	if (base) recordScope(run, outOfScopeFiles(await changedFilesSince(worktreePath, base, deps.signal), task));
 
 	if (result.timedOut) {
 		run.status = "failed";
@@ -425,6 +551,7 @@ async function runMainTask(
 	run.status = "running";
 	notify();
 
+	const before = await snapshotMainTree(deps.cwd, deps.signal);
 	const model = deps.resolveModel(task.executor_tier);
 	const runAgent = deps.runAgent ?? runPiAgent;
 	const timeoutMs = deps.taskTimeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
@@ -440,6 +567,7 @@ async function runMainTask(
 	run.report = result.text;
 	run.spec_gaps = [...(run.spec_gaps ?? []), ...parseSpecGaps(result.text)];
 	run.stalled = result.timedOut;
+	recordScope(run, outOfScopeFiles(await mainTreeChangesSince(deps.cwd, before, deps.signal), task));
 
 	if (result.timedOut) {
 		run.status = "failed";
@@ -454,11 +582,12 @@ async function runMainTask(
 }
 
 /**
- * Runs a plan's tasks wave by wave: coordinator-direct tasks are marked (not spawned), worktree
- * tasks in a wave run in parallel, main-tree tasks in a wave run sequentially in `deps.cwd`. After
- * every wave has finished, successful worktree branches are squash-merged into `deps.cwd` in
- * `merge_plan` order (or plan order), stopping at the first conflict so the coordinator can
- * resolve it in Supervise.
+ * Runs a plan's tasks wave by wave: coordinator-direct tasks are marked (not spawned); tasks whose
+ * effective workspace is a worktree (declared, or moved there by the harness so independent tasks can
+ * run in parallel) run concurrently, main-tree tasks in a wave run sequentially in `deps.cwd`, and at
+ * most `deps.maxParallel` implementer processes run at once. After every wave has finished,
+ * successful worktree branches are squash-merged into `deps.cwd` in `merge_plan` order (or plan
+ * order), stopping at the first conflict so the coordinator can resolve it in Supervise.
  */
 export async function runDelegation(
 	plan: TaskList,
@@ -469,17 +598,34 @@ export async function runDelegation(
 	const allRuns: TaskRun[] = plan.tasks.map((t) => ({ task_id: t.id, status: "pending" as const }));
 	const notify = () => deps.onProgress?.(allRuns.slice());
 
+	const decisions = planWorkspaces(plan);
+	const waves = topoWaves(plan.tasks);
+	const slots = new Semaphore(Math.max(1, Math.floor(deps.maxParallel ?? DEFAULT_MAX_PARALLEL)));
+
 	const statusResult = await git(["status", "--porcelain"], deps.cwd, deps.signal);
-	if (statusResult.stdout.trim() !== "") {
+	const dirty = statusResult.stdout.trim() !== "";
+	if (dirty) {
 		mergeLog.push("main tree has uncommitted changes; worktrees branch from HEAD");
 	}
 
-	const waves = topoWaves(plan.tasks);
+	let movedAny = false;
+	for (const t of plan.tasks) {
+		const decision = decisions.get(t.id);
+		const run = allRuns.find((r) => r.task_id === t.id);
+		if (!decision?.auto || !run) continue;
+		run.auto_worktree = true;
+		movedAny = true;
+		mergeLog.push(`task ${t.id} moved to a worktree ${decision.reason}`);
+	}
+	if (dirty && movedAny) {
+		mergeLog.push("moved tasks will not see the uncommitted changes above; set requires_main_tree on a task that needs them");
+	}
 
 	for (const wave of waves) {
-		const coordinatorTasks = wave.filter((t) => t.executor_tier === "coordinator-direct");
-		const worktreeTasks = wave.filter((t) => t.executor_tier !== "coordinator-direct" && t.workspace === "worktree");
-		const mainTasks = wave.filter((t) => t.executor_tier !== "coordinator-direct" && t.workspace === "main");
+		const coordinatorTasks = wave.filter((t) => !isSubAgentTask(t));
+		const subAgentTasks = wave.filter(isSubAgentTask);
+		const worktreeTasks = subAgentTasks.filter((t) => decisions.get(t.id)?.workspace === "worktree");
+		const mainTasks = subAgentTasks.filter((t) => decisions.get(t.id)?.workspace !== "worktree");
 
 		for (const t of coordinatorTasks) {
 			const run = allRuns.find((r) => r.task_id === t.id);
@@ -493,7 +639,12 @@ export async function runDelegation(
 				const run = allRuns.find((r) => r.task_id === t.id);
 				if (!run) return;
 				const packet = packets.find((p) => p.task_id === t.id);
-				await runWorktreeTask(t, packet, run, deps, plan, allRuns, notify);
+				const release = await slots.acquire();
+				try {
+					await runWorktreeTask(t, packet, run, deps, plan, decisions, allRuns, notify);
+				} finally {
+					release();
+				}
 			}),
 		);
 
@@ -502,7 +653,12 @@ export async function runDelegation(
 				const run = allRuns.find((r) => r.task_id === t.id);
 				if (!run) continue;
 				const packet = packets.find((p) => p.task_id === t.id);
-				await runMainTask(t, packet, run, deps, notify);
+				const release = await slots.acquire();
+				try {
+					await runMainTask(t, packet, run, deps, notify);
+				} finally {
+					release();
+				}
 			}
 		})();
 
@@ -510,8 +666,13 @@ export async function runDelegation(
 	}
 
 	// Merge worktree branches back into the main tree, in merge_plan order (default: plan order).
-	const worktreeTaskIdsInPlanOrder = plan.tasks.filter((t) => t.workspace === "worktree").map((t) => t.id);
-	const mergeOrder = plan.merge_plan?.order ?? worktreeTaskIdsInPlanOrder;
+	const worktreeTaskIdsInPlanOrder = plan.tasks
+		.filter((t) => isSubAgentTask(t) && decisions.get(t.id)?.workspace === "worktree")
+		.map((t) => t.id);
+	const declaredOrder = plan.merge_plan?.order;
+	const mergeOrder = declaredOrder
+		? [...declaredOrder, ...worktreeTaskIdsInPlanOrder.filter((id) => !declaredOrder.includes(id))]
+		: worktreeTaskIdsInPlanOrder;
 	const unmergedRemaining: string[] = [];
 	let stopMerging = false;
 

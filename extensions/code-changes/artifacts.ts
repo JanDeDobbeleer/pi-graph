@@ -7,6 +7,8 @@
  */
 
 import { Type, type Static } from "typebox";
+import { isSubAgentTask, planWorkspaces, topologicalWaves, worktreeTaskIds } from "./planning.ts";
+import { independent, overlappingPatterns } from "./paths.ts";
 import { transition, type WorkflowState, type PlanTask, type TaskList, type FailureRecord, type PullRequestRef, type AnalysisReport } from "./state.ts";
 import type { GateResult } from "./state.ts";
 
@@ -40,6 +42,17 @@ const PlanTaskSchema = Type.Object({
 	dependencies: Type.Array(Type.String(), {
 		description: "IDs of other tasks in this plan that must land first, if any.",
 	}),
+	paths: Type.Optional(
+		Type.Array(Type.String(), {
+			description:
+				'Repo-relative folders, files or globs this task may change, e.g. "src/segments/", "website/docs/segments/cloud/gcp.mdx", "src/**/*_test.go". Required for trivial/implementer tasks; independent tasks must not overlap.',
+		}),
+	),
+	requires_main_tree: Type.Optional(
+		Type.Boolean({
+			description: "True when the task needs uncommitted changes in the main tree, so it must not be moved to a worktree.",
+		}),
+	),
 });
 
 export const PlanSchema = Type.Object({
@@ -50,7 +63,10 @@ export const PlanSchema = Type.Object({
 				order: Type.Array(Type.String(), { description: "Task IDs in the order their worktrees should be merged." }),
 				conflict_owner: Type.String({ description: "Who resolves a merge conflict between worktree tasks." }),
 			},
-			{ description: "Required whenever more than one task runs in a worktree." },
+			{
+				description:
+					"Optional. When given, order must list exactly the tasks that end up in worktrees (the harness moves independent main-tree tasks there); when omitted, worktree branches merge in plan order.",
+			},
 		),
 	),
 });
@@ -237,6 +253,14 @@ export function applyAnalysis(state: WorkflowState, a: AnalysisParams): Workflow
 // 4. Plan -> Delegate
 // ---------------------------------------------------------------------------
 
+function pathProblem(raw: string): string | undefined {
+	const trimmed = raw.trim();
+	if (!trimmed) return "it is empty";
+	if (/^([a-zA-Z]:|[\\/])/.test(trimmed)) return "it must be repo-relative, not absolute";
+	if (trimmed.replace(/\\/g, "/").split("/").includes("..")) return 'it must not contain ".."';
+	return undefined;
+}
+
 export function validatePlan(plan: PlanParams): string[] {
 	const problems: string[] = [];
 
@@ -270,6 +294,16 @@ export function validatePlan(plan: PlanParams): string[] {
 			} else if (!ids.has(dep)) {
 				problems.push(`Task "${task.id}" depends on unknown task "${dep}".`);
 			}
+		}
+
+		if (isSubAgentTask(task) && (task.paths?.length ?? 0) === 0) {
+			problems.push(
+				`Task "${task.id}" has no paths; list the repo-relative folders, files or globs it may change (required for ${task.executor_tier} tasks).`,
+			);
+		}
+		for (const raw of task.paths ?? []) {
+			const issue = pathProblem(raw);
+			if (issue) problems.push(`Task "${task.id}" has an invalid path "${raw}": ${issue}.`);
 		}
 	}
 
@@ -305,31 +339,48 @@ export function validatePlan(plan: PlanParams): string[] {
 		problems.push("Plan has a dependency cycle.");
 	}
 
-	const worktreeTasks = plan.tasks.filter((t) => t.workspace === "worktree");
-	if (worktreeTasks.length > 1) {
-		if (!plan.merge_plan) {
-			problems.push("More than one task runs in a worktree; merge_plan is required.");
-		} else {
-			const worktreeIds = new Set(worktreeTasks.map((t) => t.id));
-			const orderCounts = new Map<string, number>();
-			for (const id of plan.merge_plan.order) {
-				orderCounts.set(id, (orderCounts.get(id) ?? 0) + 1);
-			}
-			const missingFromOrder = [...worktreeIds].filter((id) => !orderCounts.has(id));
-			const extraInOrder = plan.merge_plan.order.filter((id) => !worktreeIds.has(id));
-			const duplicated = [...orderCounts.entries()].filter(([, count]) => count > 1).map(([id]) => id);
-			if (missingFromOrder.length > 0) {
-				problems.push(`merge_plan.order is missing worktree task(s): ${missingFromOrder.join(", ")}.`);
-			}
-			if (extraInOrder.length > 0) {
-				problems.push(`merge_plan.order references non-worktree task(s): ${extraInOrder.join(", ")}.`);
-			}
-			if (duplicated.length > 0) {
-				problems.push(`merge_plan.order lists task(s) more than once: ${duplicated.join(", ")}.`);
-			}
-			if (!plan.merge_plan.conflict_owner.trim()) {
-				problems.push("merge_plan.conflict_owner is required.");
-			}
+	if (hasCycle) return problems;
+
+	// Independent sub-agent tasks must not be able to change the same files: they may run at the same
+	// time in separate worktrees. Coordinator-direct tasks run later, sequentially, so they are exempt.
+	const subAgentTasks = plan.tasks.filter((t) => isSubAgentTask(t) && (t.paths?.length ?? 0) > 0);
+	for (let i = 0; i < subAgentTasks.length; i++) {
+		for (let j = i + 1; j < subAgentTasks.length; j++) {
+			const a = subAgentTasks[i];
+			const b = subAgentTasks[j];
+			if (!independent(a.id, b.id, plan.tasks)) continue;
+			const pairs = overlappingPatterns(a.paths ?? [], b.paths ?? []);
+			if (pairs.length === 0) continue;
+			const detail = pairs.map(([pa, pb]) => (pa === pb ? `"${pa}"` : `"${pa}" and "${pb}"`)).join(", ");
+			problems.push(
+				`tasks ${a.id} and ${b.id} may change the same files (${detail}); add a dependency between them or merge them.`,
+			);
+		}
+	}
+
+	// merge_plan is optional (the harness merges in plan order), but when given it must name exactly the
+	// tasks that end up in worktrees, which the harness decides (see planning.ts).
+	if (plan.merge_plan) {
+		const worktreeIds = new Set(worktreeTaskIds(plan));
+		const orderCounts = new Map<string, number>();
+		for (const id of plan.merge_plan.order) {
+			orderCounts.set(id, (orderCounts.get(id) ?? 0) + 1);
+		}
+		const missingFromOrder = [...worktreeIds].filter((id) => !orderCounts.has(id));
+		const extraInOrder = plan.merge_plan.order.filter((id) => !worktreeIds.has(id));
+		const duplicated = [...orderCounts.entries()].filter(([, count]) => count > 1).map(([id]) => id);
+		const expected = worktreeIds.size > 0 ? ` (tasks that run in worktrees: ${[...worktreeIds].join(", ")})` : " (no task runs in a worktree)";
+		if (missingFromOrder.length > 0) {
+			problems.push(`merge_plan.order is missing worktree task(s): ${missingFromOrder.join(", ")}${expected}.`);
+		}
+		if (extraInOrder.length > 0) {
+			problems.push(`merge_plan.order references non-worktree task(s): ${extraInOrder.join(", ")}${expected}.`);
+		}
+		if (duplicated.length > 0) {
+			problems.push(`merge_plan.order lists task(s) more than once: ${duplicated.join(", ")}.`);
+		}
+		if (!plan.merge_plan.conflict_owner.trim()) {
+			problems.push("merge_plan.conflict_owner is required.");
 		}
 	}
 
@@ -362,12 +413,23 @@ export function formatPlan(plan: TaskList, opts?: { edited?: boolean }): string 
 	const lines: string[] = [];
 	lines.push("# Plan");
 	if (opts?.edited) lines.push("_(edited by you)_");
+	let decisions: ReturnType<typeof planWorkspaces> | undefined;
+	try {
+		decisions = planWorkspaces(plan);
+	} catch {
+		decisions = undefined; // cyclic plan: validatePlan reports it; just skip the computed sections
+	}
 	for (const t of plan.tasks) {
 		lines.push("");
 		lines.push(`## Task ${t.id}`);
 		lines.push(`- executor tier: ${t.executor_tier}`);
-		lines.push(`- workspace: ${t.workspace}`);
+		const decision = decisions?.get(t.id);
+		lines.push(
+			`- workspace: ${t.workspace}${decision?.auto ? " (the harness moves it to a worktree so it can run in parallel)" : ""}`,
+		);
 		lines.push(`- dependencies: ${t.dependencies.length > 0 ? t.dependencies.join(", ") : "none"}`);
+		lines.push(`- paths: ${t.paths && t.paths.length > 0 ? t.paths.join(", ") : "(unspecified)"}`);
+		if (t.requires_main_tree) lines.push("- requires main tree: yes (never moved to a worktree)");
 		lines.push("");
 		lines.push("### Spec");
 		lines.push(t.spec);
@@ -379,15 +441,51 @@ export function formatPlan(plan: TaskList, opts?: { edited?: boolean }): string 
 			lines.push("- (none)");
 		}
 	}
+	if (decisions) {
+		lines.push("");
+		lines.push("## Parallelism");
+		lines.push(...formatParallelism(plan, decisions));
+	}
 	lines.push("");
 	lines.push("## Merge plan");
+	const worktreeIds = decisions ? worktreeTaskIds(plan) : [];
 	if (plan.merge_plan) {
 		lines.push(`- order: ${plan.merge_plan.order.join(" -> ")}`);
 		lines.push(`- conflict owner: ${plan.merge_plan.conflict_owner}`);
+	} else if (worktreeIds.length > 1) {
+		lines.push(`- not specified: the harness merges worktree branches in plan order (${worktreeIds.join(" -> ")})`);
 	} else {
 		lines.push("- (no more than one worktree task; nothing to merge)");
 	}
 	return lines.join("\n");
+}
+
+/** Wave-by-wave description of which tasks run together and which move to worktrees. */
+function formatParallelism(plan: TaskList, decisions: ReturnType<typeof planWorkspaces>): string[] {
+	const lines: string[] = [];
+	const label = (t: PlanTask) => {
+		const d = decisions.get(t.id);
+		return `${t.id} (${d?.workspace ?? t.workspace}${d?.auto ? ", moved from main" : ""})`;
+	};
+	topologicalWaves(plan.tasks).forEach((wave, index) => {
+		const subAgent = wave.filter(isSubAgentTask);
+		const direct = wave.filter((t) => !isSubAgentTask(t));
+		const worktree = subAgent.filter((t) => decisions.get(t.id)?.workspace === "worktree");
+		const main = subAgent.filter((t) => decisions.get(t.id)?.workspace !== "worktree");
+		const parts: string[] = [];
+		if (subAgent.length > 0) {
+			const concurrent = worktree.length > 1 || (worktree.length > 0 && main.length > 0);
+			parts.push(`${subAgent.map(label).join(", ")}${concurrent ? " -- run in parallel" : subAgent.length > 1 ? " -- run one after another in the main tree" : ""}`);
+			if (concurrent && main.length > 1) parts.push("main-tree tasks in this wave run one after another");
+		}
+		if (direct.length > 0) parts.push(`coordinator-direct, run in Supervise: ${direct.map((t) => t.id).join(", ")}`);
+		lines.push(`- Wave ${index + 1}: ${parts.join("; ")}`);
+	});
+	for (const t of plan.tasks) {
+		const d = decisions.get(t.id);
+		if (d?.auto) lines.push(`- ${t.id} moves to a worktree ${d.reason}.`);
+	}
+	return lines;
 }
 
 const PLAN_EDIT_COMMENT = [
@@ -399,7 +497,9 @@ const PLAN_EDIT_COMMENT = [
 	'  - tasks[].executor_tier: "trivial" | "implementer" | "coordinator-direct"',
 	'  - tasks[].workspace: "main" | "worktree"',
 	"  - tasks[].dependencies: ids of other tasks in this plan that must land first, if any",
-	"  - merge_plan (required whenever more than one task runs in a worktree):",
+	'  - tasks[].paths: repo-relative folders, files or globs the task may change (required for sub-agent tasks; independent tasks must not overlap)',
+	"  - tasks[].requires_main_tree: optional; true keeps the task in the main tree (needs uncommitted local changes)",
+	"  - merge_plan (optional; when given it must list exactly the tasks that run in worktrees, otherwise plan order is used):",
 	"      order: task ids in the order their worktrees should be merged",
 	"      conflict_owner: who resolves a merge conflict between worktree tasks",
 	"-->",
@@ -459,27 +559,7 @@ export function buildPackets(plan: TaskList) {
 	}));
 }
 
-export function topologicalWaves(tasks: PlanTask[]): PlanTask[][] {
-	const byId = new Map(tasks.map((t) => [t.id, t]));
-	const remainingDeps = new Map<string, Set<string>>();
-	for (const t of tasks) {
-		remainingDeps.set(t.id, new Set(t.dependencies.filter((d) => byId.has(d))));
-	}
-
-	const waves: PlanTask[][] = [];
-	const placed = new Set<string>();
-	while (placed.size < tasks.length) {
-		const wave = tasks.filter((t) => !placed.has(t.id) && [...remainingDeps.get(t.id)!].every((d) => placed.has(d)));
-		if (wave.length === 0) {
-			// Defensive: shouldn't happen for a validated plan (no cycles), but avoid an infinite loop.
-			waves.push(tasks.filter((t) => !placed.has(t.id)));
-			break;
-		}
-		waves.push(wave);
-		for (const t of wave) placed.add(t.id);
-	}
-	return waves;
-}
+export { topologicalWaves };
 
 // ---------------------------------------------------------------------------
 // 7. Supervise -> Verify
@@ -742,7 +822,9 @@ export function summarizeState(state: WorkflowState): string {
 		lines.push("");
 		lines.push("## Plan");
 		for (const t of state.plan.tasks) {
-			lines.push(`- ${t.id} [${t.executor_tier}/${t.workspace}] deps=${t.dependencies.join(",") || "none"}`);
+			lines.push(
+				`- ${t.id} [${t.executor_tier}/${t.workspace}] deps=${t.dependencies.join(",") || "none"}${t.paths?.length ? ` paths=${t.paths.join(",")}` : ""}${t.requires_main_tree ? " requires_main_tree" : ""}`,
+			);
 		}
 		if (state.plan.merge_plan) {
 			lines.push(`- merge order: ${state.plan.merge_plan.order.join(" -> ")}, owner: ${state.plan.merge_plan.conflict_owner}`);

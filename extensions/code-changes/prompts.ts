@@ -171,6 +171,9 @@ const EXTERNAL_CONTEXT_LINE =
 	"Read-only external context is available: `gh` (issue/pr/run/workflow/release view|list, pr diff|checks, repo view, search, label list, read-only api), " +
 	"`curl`/`Invoke-WebRequest` GETs, `git fetch`/`git ls-remote`, and any configured read-only tools (see README's `readOnlyTools`).";
 
+const PLAN_PARALLELISM_LINE =
+	"Split work by folder: give every sub-agent task `paths` (the folders/files/globs it may change). Independent tasks with non-overlapping paths run in parallel in separate worktrees automatically; overlapping independent tasks are rejected — add a dependency or merge them. Set requires_main_tree only when the task needs uncommitted local changes.";
+
 function phaseExtra(state: WorkflowState): string | undefined {
 	switch (state.phase) {
 		case "analyze": {
@@ -184,7 +187,7 @@ function phaseExtra(state: WorkflowState): string | undefined {
 			return lines.join("\n");
 		}
 		case "plan":
-			return EXTERNAL_CONTEXT_LINE;
+			return [EXTERNAL_CONTEXT_LINE, PLAN_PARALLELISM_LINE].join("\n");
 		case "delegate":
 			return "Call run_delegation now; it dispatches the plan's tasks.";
 		case "supervise": {
@@ -193,6 +196,14 @@ function phaseExtra(state: WorkflowState): string | undefined {
 			if (coordinatorTasks.length > 0) {
 				lines.push(
 					`Coordinator-direct task(s) the coordinator must implement itself: ${coordinatorTasks.map((r) => r.task_id).join(", ")}.`,
+				);
+			}
+			const outOfScope = state.runs.filter((r) => r.out_of_scope && r.out_of_scope.length > 0);
+			if (outOfScope.length > 0) {
+				lines.push(
+					`Run(s) that changed files outside their declared paths (review these first; revert the stray changes or justify them in submit_review overrides): ${outOfScope
+						.map((r) => `${r.task_id} (${(r.out_of_scope ?? []).join(", ")})`)
+						.join("; ")}.`,
 				);
 			}
 			const conflicts = state.runs.filter((r) => r.conflict);

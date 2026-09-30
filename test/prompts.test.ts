@@ -322,3 +322,35 @@ describe("stripping measurably shrinks phase prompts", () => {
 		console.log(`Phase prompt sizes (harness-stripped vs unstripped references):\n${rows.join("\n")}`);
 	});
 });
+
+describe("parallel delegation guidance", () => {
+	it("tells the Plan phase to split work by folder and give every sub-agent task paths", () => {
+		const text = phasePrompt(stateInPhase("plan"));
+		expect(text).toContain("Split work by folder");
+		expect(text).toContain("`paths`");
+		expect(text).toContain("requires_main_tree");
+		expect(text).toContain("overlapping independent tasks are rejected");
+	});
+
+	it("keeps the paths bullet in plan.md for standalone use, and strips only the enforced rejection sentence", () => {
+		const raw = readReference("plan", { harness: false });
+		expect(raw).toContain("Give each task the `paths` it may change");
+		expect(raw).toContain("Independent tasks whose paths overlap are rejected");
+		const injected = readReference("plan");
+		expect(injected).toContain("Give each task the `paths` it may change");
+		expect(injected).not.toContain("Independent tasks whose paths overlap are rejected");
+	});
+
+	it("lists runs that changed files outside their declared paths in supervise", () => {
+		const state = stateInPhase("supervise", {
+			runs: [
+				{ task_id: "t1", status: "succeeded", out_of_scope: ["stray.txt", "docs/x.md"] },
+				{ task_id: "t2", status: "succeeded" },
+			],
+		});
+		const text = phasePrompt(state);
+		expect(text).toContain("outside their declared paths");
+		expect(text).toContain("t1 (stray.txt, docs/x.md)");
+		expect(text).not.toContain("t2 (");
+	});
+});

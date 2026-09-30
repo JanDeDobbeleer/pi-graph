@@ -15,6 +15,7 @@ function makeTask(overrides: Partial<PlanTask> & Pick<PlanTask, "id">): PlanTask
 		executor_tier: "implementer",
 		workspace: "worktree",
 		dependencies: [],
+		paths: ["."],
 		...overrides,
 	};
 }

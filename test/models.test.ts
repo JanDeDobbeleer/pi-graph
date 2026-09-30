@@ -3,8 +3,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+	DEFAULT_MAX_PARALLEL,
 	DEFAULT_READ_ONLY_TOOLS,
 	DEFAULT_TIERS,
+	loadMaxParallel,
 	loadReadOnlyTools,
 	loadTierConfig,
 	modelRef,
@@ -185,5 +187,67 @@ describe("tierForExecutor", () => {
 describe("modelRef", () => {
 	it("formats provider/id", () => {
 		expect(modelRef({ provider: "anthropic", id: "claude-sonnet-5" } as any)).toBe("anthropic/claude-sonnet-5");
+	});
+});
+
+describe("loadMaxParallel", () => {
+	let homeDir: string;
+	let cwdDir: string;
+
+	beforeEach(() => {
+		homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-mp-home-"));
+		cwdDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-mp-cwd-"));
+	});
+
+	afterEach(() => {
+		fs.rmSync(homeDir, { recursive: true, force: true });
+		fs.rmSync(cwdDir, { recursive: true, force: true });
+	});
+
+	const writeUser = (data: unknown) => {
+		fs.mkdirSync(path.join(homeDir, ".pi", "agent"), { recursive: true });
+		fs.writeFileSync(path.join(homeDir, ".pi", "agent", "code-changes.json"), typeof data === "string" ? data : JSON.stringify(data));
+	};
+	const writeProject = (data: unknown) => {
+		fs.mkdirSync(path.join(cwdDir, ".pi"), { recursive: true });
+		fs.writeFileSync(path.join(cwdDir, ".pi", "code-changes.json"), typeof data === "string" ? data : JSON.stringify(data));
+	};
+
+	it("defaults to 4 without config", () => {
+		expect(DEFAULT_MAX_PARALLEL).toBe(4);
+		expect(loadMaxParallel(cwdDir, homeDir)).toBe(4);
+	});
+
+	it("reads the user config", () => {
+		writeUser({ maxParallel: 2 });
+		expect(loadMaxParallel(cwdDir, homeDir)).toBe(2);
+	});
+
+	it("lets the project config override the user config", () => {
+		writeUser({ maxParallel: 2 });
+		writeProject({ maxParallel: 8 });
+		expect(loadMaxParallel(cwdDir, homeDir)).toBe(8);
+	});
+
+	it("ignores out-of-range, non-integer and non-numeric values, falling back to the next source", () => {
+		writeUser({ maxParallel: 6 });
+		for (const bad of [0, 17, -1, 2.5, "3", null, true]) {
+			writeProject({ maxParallel: bad });
+			expect(loadMaxParallel(cwdDir, homeDir)).toBe(6);
+		}
+		writeUser({ maxParallel: 99 });
+		expect(loadMaxParallel(cwdDir, homeDir)).toBe(4);
+	});
+
+	it("accepts the bounds 1 and 16", () => {
+		writeProject({ maxParallel: 1 });
+		expect(loadMaxParallel(cwdDir, homeDir)).toBe(1);
+		writeProject({ maxParallel: 16 });
+		expect(loadMaxParallel(cwdDir, homeDir)).toBe(16);
+	});
+
+	it("ignores invalid JSON", () => {
+		writeProject("{ not json");
+		expect(loadMaxParallel(cwdDir, homeDir)).toBe(4);
 	});
 });

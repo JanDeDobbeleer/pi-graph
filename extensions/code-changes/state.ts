@@ -58,6 +58,10 @@ export interface PlanTask {
 	executor_tier: ExecutorTier;
 	workspace: "main" | "worktree";
 	dependencies: string[];
+	/** Repo-relative folders, files or globs this task may change. Required for sub-agent tasks. */
+	paths?: string[];
+	/** Keep this task in the main tree even when it could run in a worktree (needs uncommitted local changes). */
+	requires_main_tree?: boolean;
 }
 
 export interface TaskList {
@@ -90,6 +94,10 @@ export interface TaskRun {
 	conflict?: boolean;
 	/** Spec gaps the implementer reported (lines starting with "SPEC GAP:"), across all attempts. */
 	spec_gaps?: string[];
+	/** Changed files outside the task's declared paths. */
+	out_of_scope?: string[];
+	/** True when the harness moved a main-tree task into a worktree to run it in parallel. */
+	auto_worktree?: boolean;
 	/** True when the implementer was killed for exceeding its time budget. */
 	stalled?: boolean;
 	/** True once repeated spec gaps on this task were escalated (escalate.md trigger). */

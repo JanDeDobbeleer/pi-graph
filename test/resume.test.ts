@@ -30,6 +30,7 @@ function makeTask(overrides: Partial<PlanTask> & Pick<PlanTask, "id">): PlanTask
 		executor_tier: "implementer",
 		workspace: "worktree",
 		dependencies: [],
+		paths: ["."],
 		...overrides,
 	};
 }
@@ -182,6 +183,92 @@ describe("resume_task", () => {
 			expect(secondRun.spec_gaps).toEqual(["first gap", "second gap", "third gap"]);
 			expect(deps.escalateCalls).toBe(1); // no second escalation call
 			expect(deps.getState()?.escalations).toHaveLength(1);
+		},
+		TIMEOUT,
+	);
+});
+
+describe("resume_task scope recheck", () => {
+	it(
+		"recomputes out_of_scope for a worktree task after a resume, and clears it once fixed",
+		async () => {
+			const repo = await makeTempRepo();
+			const worktreePath = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-cc-resume-scope-wt-"));
+			try {
+				const branch = "pi-cc/rs1/task-a";
+				await git(["worktree", "add", "-b", branch, worktreePath, "HEAD"], repo);
+				await fs.promises.mkdir(path.join(worktreePath, "pkg"), { recursive: true });
+				await fs.promises.writeFile(path.join(worktreePath, "pkg", "a.txt"), "first\n", "utf-8");
+				await git(["add", "-A"], worktreePath);
+				await git(["commit", "-m", "wip(task-a): implementer output"], worktreePath);
+
+				const task = makeTask({ id: "task-a", workspace: "worktree", paths: ["pkg/"] });
+				const run: TaskRun = { task_id: "task-a", status: "succeeded", worktree: worktreePath, branch };
+				const state = baseState(task, run, "supervise");
+				let strayMode: "write" | "remove" = "write";
+				const deps = makeDeps({
+					state,
+					runAgent: async (opts) => {
+						if (strayMode === "write") {
+							await fs.promises.writeFile(path.join(opts.cwd, "stray.txt"), "oops\n", "utf-8");
+						} else {
+							await fs.promises.rm(path.join(opts.cwd, "stray.txt"), { force: true });
+						}
+						return { exitCode: 0, text: "resumed", stderr: "", timedOut: false };
+					},
+				});
+				const tool = createResumeTaskTool(deps);
+
+				const first = await tool.execute("c1", { task_id: "task-a", answer: "go on" }, undefined, undefined, ctxFor(repo));
+				const firstRun = (first.details as { run: TaskRun }).run;
+				expect(firstRun.out_of_scope).toEqual(["stray.txt"]);
+				expect(firstRun.spec_gaps).toEqual(["changed files outside its declared paths: stray.txt"]);
+				expect(needsSpecGapEscalation({ ...firstRun, spec_gaps: [...(firstRun.spec_gaps ?? []), "another"] })).toBe(true);
+
+				strayMode = "remove";
+				const second = await tool.execute("c2", { task_id: "task-a", answer: "remove it" }, undefined, undefined, ctxFor(repo));
+				const secondRun = (second.details as { run: TaskRun }).run;
+				expect(secondRun.out_of_scope).toBeUndefined();
+				expect(secondRun.spec_gaps).toEqual([]);
+			} finally {
+				await git(["worktree", "remove", "--force", worktreePath], repo).catch(() => undefined);
+				await rmrf(repo);
+				await rmrf(worktreePath);
+			}
+		},
+		TIMEOUT,
+	);
+
+	it(
+		"records out_of_scope for a main-tree task resume, without duplicating the spec-gap line",
+		async () => {
+			const repo = await makeTempRepo();
+			try {
+				const task = makeTask({ id: "task-a", workspace: "main", paths: ["pkg/"] });
+				const run: TaskRun = { task_id: "task-a", status: "failed" };
+				const state = baseState(task, run, "supervise");
+				const deps = makeDeps({
+					state,
+					runAgent: async (opts) => {
+						await fs.promises.mkdir(path.join(opts.cwd, "pkg"), { recursive: true });
+						await fs.promises.writeFile(path.join(opts.cwd, "pkg", "a.txt"), "in scope\n", "utf-8");
+						await fs.promises.writeFile(path.join(opts.cwd, "stray.txt"), "oops\n", "utf-8");
+						return { exitCode: 0, text: "resumed", stderr: "", timedOut: false };
+					},
+				});
+				const tool = createResumeTaskTool(deps);
+
+				const first = await tool.execute("c1", { task_id: "task-a", answer: "go" }, undefined, undefined, ctxFor(repo));
+				expect((first.details as { run: TaskRun }).run.out_of_scope).toEqual(["stray.txt"]);
+
+				const second = await tool.execute("c2", { task_id: "task-a", answer: "again" }, undefined, undefined, ctxFor(repo));
+				const secondRun = (second.details as { run: TaskRun }).run;
+				// stray.txt is still dirty from the first resume, so it stays flagged - exactly once.
+				expect(secondRun.out_of_scope).toEqual(["stray.txt"]);
+				expect(secondRun.spec_gaps).toEqual(["changed files outside its declared paths: stray.txt"]);
+			} finally {
+				await rmrf(repo);
+			}
 		},
 		TIMEOUT,
 	);
