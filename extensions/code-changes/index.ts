@@ -59,9 +59,24 @@ import { CiWatcher, detectPrFromText, formatCiFailure, isPushCommand, resolvePr,
 import { cleanupWorktrees, mergedDiff, runDelegation } from "./delegate.ts";
 import { runEscalation } from "./escalate.ts";
 import { checkGateCommands } from "./gatecheck.ts";
+import { adviceCommand, adviceNote, askGateAdvisor, resolveGateAdvisor, withSuggestion } from "./gateadvisor.ts";
+import {
+	appendDecisionLog,
+	buildDecisionRecord,
+	fingerprint,
+	GATE_DECISION_ENTRY,
+	gateArtifact,
+	gateChoices,
+	gateForPhase,
+	PLAN_GATE_LABELS,
+	withDecisionRecorded,
+	type GateAdvice,
+	type GateDecision,
+	type GateKind,
+} from "./gatelog.ts";
 import { decideToolCall, READ_ONLY_PHASES, toolsForPhase, WORKFLOW_TOOLS } from "./gates.ts";
 import { discoverStopHooks, findRepoRoot, formatHookFeedback, hooksBlocked, runStopHooks, StopHookGuard, type StopHook } from "./hooks.ts";
-import { loadMaxParallel, loadReadOnlyTools, loadTierConfig, modelRef, resolveTierModel, tierForExecutor } from "./models.ts";
+import { loadGateAdvisorRaw, loadGateLogPath, loadMaxParallel, loadReadOnlyTools, loadTierConfig, modelRef, resolveTierModel, tierForExecutor } from "./models.ts";
 import { phasePrompt, phaseReminder } from "./prompts.ts";
 import { createResumeTaskTool, escalateSpecGaps, needsSpecGapEscalation, type ResumeDeps } from "./resume.ts";
 import { isTransientProviderError, MAX_TRANSIENT_RETRIES, retryBackoff } from "./retry.ts";
@@ -210,6 +225,76 @@ export default function codeChanges(pi: ExtensionAPI): void {
 
 	function persist(): void {
 		pi.appendEntry(STATE_ENTRY, state);
+	}
+
+	// -------------------------------------------------------------------------
+	// Gate decisions and advice
+	// -------------------------------------------------------------------------
+
+	/** Advisor config problems already reported this session, so a gate warns once, not every time. */
+	const advisorWarnings = new Set<string>();
+
+	/**
+	 * Record a human decision at the open gate: a session entry plus a line in the gate-decision
+	 * log file. Call it before the decision is applied, so the record holds the artifact the human
+	 * actually saw; it updates `state` (history, cleared advice) in place for the caller to build on.
+	 */
+	function recordGateDecision(
+		ctx: ExtensionContext,
+		decision: GateDecision,
+		via: "dialog" | "command",
+		extra: { optionId?: string; feedback?: string } = {},
+	): void {
+		if (!state) return;
+		const gate = gateForPhase(state.phase);
+		if (!gate) return;
+		const record = buildDecisionRecord(state, { gate, decision, via, cwd: ctx.cwd, ...extra });
+		if (!record) return;
+		pi.appendEntry(GATE_DECISION_ENTRY, record);
+		const file = loadGateLogPath(ctx.cwd);
+		const error = file ? appendDecisionLog(file, record) : undefined;
+		if (error && !advisorWarnings.has(`log:${error}`)) {
+			advisorWarnings.add(`log:${error}`);
+			ctx.ui.notify(`code-changes: could not write the gate-decision log (${error}); decisions stay in the session.`, "warning");
+		}
+		state = withDecisionRecorded(state, record);
+	}
+
+	/**
+	 * The gate advisor's suggestion for the open gate, when one is configured: cached per artifact
+	 * so re-opening the gate (or /change show) does not ask again. Never throws, never blocks.
+	 */
+	async function gateAdvice(ctx: ExtensionContext, gate: GateKind): Promise<GateAdvice | undefined> {
+		if (!state) return undefined;
+		const artifact = gateArtifact(gate, state);
+		if (!artifact) return undefined;
+		const fp = fingerprint(artifact);
+		if (state.gateAdvice?.gate === gate && state.gateAdvice.advice.fingerprint === fp) return state.gateAdvice.advice;
+
+		const setup = resolveGateAdvisor(loadGateAdvisorRaw(ctx.cwd), process.env);
+		if (!setup.config) {
+			if (setup.reason && !advisorWarnings.has(setup.reason)) {
+				advisorWarnings.add(setup.reason);
+				ctx.ui.notify(`code-changes: ${setup.reason}`, "warning");
+			}
+			return undefined;
+		}
+		const asked = state;
+		const result = await askGateAdvisor(setup, gate, asked, { hasUI: ctx.hasUI });
+		if (!result.advice) {
+			const key = `advice:${result.reason}`;
+			if (!advisorWarnings.has(key)) {
+				advisorWarnings.add(key);
+				ctx.ui.notify(`code-changes: no gate suggestion (${result.reason}).`, "info");
+			}
+			return undefined;
+		}
+		// Only cache when the gate is still the one we asked about.
+		if (state && state.phase === asked.phase && gateArtifact(gate, state) === artifact) {
+			state = { ...state, gateAdvice: { gate, advice: result.advice } };
+			persist();
+		}
+		return result.advice;
 	}
 
 	function applyPhaseTools(): void {
@@ -511,14 +596,17 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		if (!state || state.phase !== "awaiting_approval") return;
 		if ((opts?.resend ?? true) && state.analysis) sendAnalysisMessage(state);
 
+		const advice = await gateAdvice(ctx, "analysis");
+		if (!state || state.phase !== "awaiting_approval") return; // state moved on while the advisor was asked
+
 		if (!ctx.hasUI) {
-			ctx.ui.notify(NO_UI_GATE_HINT, "info");
+			ctx.ui.notify(advice ? `${NO_UI_GATE_HINT}\nSuggestion: ${adviceCommand(advice)} — ${adviceNote(advice)}.` : NO_UI_GATE_HINT, "info");
 			return;
 		}
 
-		const options = analysisGateChoices(state.analysis!);
+		const suggested = withSuggestion(analysisGateChoices(state.analysis!), gateChoices("analysis", state), advice);
 
-		const choice = await ctx.ui.select(`Review the ${state.analysis!.kind} analysis above — what next?`, options);
+		const choice = suggested.resolve(await ctx.ui.select(`Review the ${state.analysis!.kind} analysis above — what next?`, suggested.labels));
 		if (!state || state.phase !== "awaiting_approval") return; // state moved on while the dialog was open
 
 		if (choice === undefined) {
@@ -528,6 +616,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 
 		const optionId = optionIdFromChoice(state.analysis!, choice);
 		if (optionId !== undefined) {
+			recordGateDecision(ctx, "choose_option", "dialog", { optionId });
 			const picked = { ...state, analysis: selectOption(state.analysis!, optionId) };
 			setState(transition(picked, "plan"), ctx);
 			await enterPhase(ctx);
@@ -535,12 +624,14 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		}
 
 		if (choice === "Approve") {
+			recordGateDecision(ctx, "approve", "dialog");
 			setState(transition(state, "plan"), ctx);
 			await enterPhase(ctx);
 			return;
 		}
 
 		if (choice === "Approve and allow push/PR") {
+			recordGateDecision(ctx, "approve_push", "dialog");
 			const allowed = { ...state, pushAllowed: true };
 			setState(transition(allowed, "plan"), ctx);
 			await enterPhase(ctx);
@@ -555,6 +646,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 				await openApprovalGate(ctx, { resend: false });
 				return;
 			}
+			recordGateDecision(ctx, "edit", "dialog");
 			try {
 				const parsed = parseAnalysisMarkdown(edited);
 				const next = { ...state, analysis: parsed, analysisEditedByHuman: true };
@@ -571,18 +663,21 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		if (choice === "Send feedback to revise") {
 			const feedback = await ctx.ui.editor("Revise the analysis:", "");
 			if (!state) return;
+			recordGateDecision(ctx, "revise", "dialog", { feedback });
 			setState(transition(state, "analyze"), ctx);
 			await enterPhase(ctx, feedback?.trim());
 			return;
 		}
 
 		if (choice === "Done — no implementation") {
+			recordGateDecision(ctx, "done", "dialog");
 			await finishWithAnalysis(ctx);
 			return;
 		}
 
 		if (choice === "Stop the run") {
-			const stopped = stopRun(state, "stopped by user at the approval gate");
+			recordGateDecision(ctx, "stop", "dialog");
+			const stopped = stopRun(state!, "stopped by user at the approval gate");
 			setState(stopped, ctx);
 			await enterPhase(ctx);
 			return;
@@ -635,13 +730,16 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		if (!state || state.phase !== "awaiting_plan_approval") return;
 		if ((opts?.resend ?? true) && state.plan) await sendPlanMessage(state, ctx);
 
+		const advice = await gateAdvice(ctx, "plan");
+		if (!state || state.phase !== "awaiting_plan_approval") return; // state moved on while the advisor was asked
+
 		if (!ctx.hasUI) {
-			ctx.ui.notify(NO_UI_PLAN_GATE_HINT, "info");
+			ctx.ui.notify(advice ? `${NO_UI_PLAN_GATE_HINT}\nSuggestion: ${adviceCommand(advice)} — ${adviceNote(advice)}.` : NO_UI_PLAN_GATE_HINT, "info");
 			return;
 		}
 
-		const options = ["Approve — start delegation", "Edit the plan myself", "Send feedback to revise", "Stop the run"];
-		const choice = await ctx.ui.select("Review the plan above", options);
+		const suggested = withSuggestion(PLAN_GATE_LABELS, gateChoices("plan", state), advice);
+		const choice = suggested.resolve(await ctx.ui.select("Review the plan above", suggested.labels));
 		if (!state || state.phase !== "awaiting_plan_approval") return; // state moved on while the dialog was open
 
 		if (choice === undefined) {
@@ -650,6 +748,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		}
 
 		if (choice === "Approve — start delegation") {
+			recordGateDecision(ctx, "approve", "dialog");
 			setState(transition(state, "delegate"), ctx);
 			await enterPhase(ctx);
 			return;
@@ -663,6 +762,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 				await openPlanApprovalGate(ctx, { resend: false });
 				return;
 			}
+			recordGateDecision(ctx, "edit", "dialog");
 			try {
 				const parsed = parseEditablePlan(edited);
 				const next = { ...state, plan: parsed, packets: buildPackets(parsed), planEditedByHuman: true };
@@ -679,13 +779,15 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		if (choice === "Send feedback to revise") {
 			const feedback = await ctx.ui.editor("Revise the plan:", "");
 			if (!state) return;
+			recordGateDecision(ctx, "revise", "dialog", { feedback });
 			setState(transition(state, "plan"), ctx);
 			await enterPhase(ctx, feedback?.trim());
 			return;
 		}
 
 		if (choice === "Stop the run") {
-			const stopped = stopRun(state, "stopped by user at the plan approval gate");
+			recordGateDecision(ctx, "stop", "dialog");
+			const stopped = stopRun(state!, "stopped by user at the plan approval gate");
 			setState(stopped, ctx);
 			await enterPhase(ctx);
 			return;
@@ -836,9 +938,11 @@ export default function codeChanges(pi: ExtensionAPI): void {
 						);
 						return;
 					}
-					setState(transition(state, "plan"), ctx);
+					recordGateDecision(ctx, "approve", "command");
+					setState(transition(state!, "plan"), ctx);
 				} else {
-					setState(transition(state, "delegate"), ctx);
+					recordGateDecision(ctx, "approve", "command");
+					setState(transition(state!, "delegate"), ctx);
 				}
 				await enterPhase(ctx);
 				return;
@@ -855,7 +959,9 @@ export default function codeChanges(pi: ExtensionAPI): void {
 					return;
 				}
 				try {
-					const picked = { ...state, analysis: selectOption(state.analysis, restText) };
+					const analysis = selectOption(state.analysis, restText);
+					recordGateDecision(ctx, "choose_option", "command", { optionId: restText });
+					const picked = { ...state!, analysis };
 					setState(transition(picked, "plan"), ctx);
 				} catch (err) {
 					ctx.ui.notify(`code-changes: ${err instanceof Error ? err.message : String(err)}`, "warning");
@@ -870,6 +976,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 					ctx.ui.notify("code-changes: /change done only applies while the analysis is awaiting approval.", "warning");
 					return;
 				}
+				recordGateDecision(ctx, "done", "command");
 				await finishWithAnalysis(ctx);
 				return;
 			}
@@ -883,10 +990,11 @@ export default function codeChanges(pi: ExtensionAPI): void {
 					ctx.ui.notify("code-changes: usage: /change revise <feedback>", "warning");
 					return;
 				}
-				if (state.phase === "awaiting_approval") {
-					setState(transition(state, "analyze"), ctx);
+				recordGateDecision(ctx, "revise", "command", { feedback: restText });
+				if (state!.phase === "awaiting_approval") {
+					setState(transition(state!, "analyze"), ctx);
 				} else {
-					setState(transition(state, "plan"), ctx);
+					setState(transition(state!, "plan"), ctx);
 				}
 				await enterPhase(ctx, restText);
 				return;
@@ -946,7 +1054,8 @@ export default function codeChanges(pi: ExtensionAPI): void {
 					return;
 				}
 				if (state.pr) ciWatcher.stop(state.pr.number);
-				const aborted = stopRun(state, "aborted by user");
+				recordGateDecision(ctx, "stop", "command"); // no-op unless a gate is open
+				const aborted = stopRun(state!, "aborted by user");
 				setState(aborted, ctx);
 				await cleanupWorktrees(state.runs, ctx.cwd);
 				ctx.ui.notify("code-changes: run aborted.", "warning");

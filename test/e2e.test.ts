@@ -17,9 +17,10 @@ import type { Api, AssistantMessage, AssistantMessageEventStream, Model, SimpleS
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
+import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import codeChanges from "../extensions/code-changes/index.ts";
 import { resetRetrySleep, setRetrySleep } from "../extensions/code-changes/retry.ts";
 import { git } from "../extensions/code-changes/runner.ts";
@@ -47,7 +48,18 @@ async function writeJson(filePath: string, data: unknown): Promise<void> {
 }
 
 const cleanupDirs: string[] = [];
+
+// Runs write the gate-decision log under the user's home; keep them out of the real one.
+let realHome: string | undefined;
+beforeEach(async () => {
+	realHome = process.env.HOME;
+	const home = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-cc-e2e-home-"));
+	cleanupDirs.push(home);
+	process.env.HOME = home;
+});
+
 afterEach(async () => {
+	process.env.HOME = realHome;
 	while (cleanupDirs.length > 0) {
 		const dir = cleanupDirs.pop();
 		if (dir) await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => undefined);
@@ -616,6 +628,104 @@ describe("code-changes e2e (real pi runtime, scripted fake model)", () => {
 				expect(last.phase).not.toBe("plan");
 			} finally {
 				session.dispose();
+			}
+		},
+		TIMEOUT,
+	);
+	it(
+		"logs every gate decision with the gate advisor's suggestion attached",
+		async () => {
+			const repo = await makeTempRepo();
+			cleanupDirs.push(repo);
+			const home = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-cc-e2e-home-"));
+			cleanupDirs.push(home);
+
+			// A stand-in for Jev: suggests approving, whatever it is asked.
+			const requests: any[] = [];
+			const server = http.createServer((req, res) => {
+				let body = "";
+				req.on("data", (chunk) => (body += chunk));
+				req.on("end", () => {
+					requests.push({ auth: req.headers.authorization, body: JSON.parse(body) });
+					res.setHeader("Content-Type", "application/json");
+					res.end(JSON.stringify({ model: "jev-test", answers: { decision: { type: "choice", choice: "approve", confidence: 0.88 } } }));
+				});
+			});
+			await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+			const port = (server.address() as { port: number }).port;
+
+			const logFile = path.join(home, "gate-decisions.jsonl");
+			await writeJson(path.join(home, ".pi", "agent", "code-changes.json"), {
+				gateLog: logFile,
+				gateAdvisor: { provider: "jev", endpoint: `http://127.0.0.1:${port}/v1/systemone`, apiKeyEnv: "PI_CC_E2E_JEV_KEY" },
+			});
+			process.env.HOME = home;
+			process.env.PI_CC_E2E_JEV_KEY = "test-key";
+
+			const { extension: fakeProvider, model, queue } = makeFakeProvider();
+			const session = await makeSession(repo, [fakeProvider], model);
+
+			try {
+				queue.push({
+					tool: "submit_analysis",
+					args: {
+						kind: "bug",
+						findings: "greeting.txt says Hello instead of Hi",
+						proposed_change: "change the greeting text to Hi",
+						out_of_scope: "nothing else",
+						evidence: "reproduced: read greeting.txt",
+						open_questions: [],
+					},
+				});
+				await session.prompt("/change fix the greeting");
+				await session.waitForIdle();
+
+				queue.push({
+					tool: "submit_plan",
+					args: {
+						tasks: [
+							{
+								id: "t1",
+								spec: "Change greeting.txt to say Hi instead of Hello.",
+								verification_commands: ['node -e "process.exit(0)"'],
+								executor_tier: "coordinator-direct",
+								workspace: "main",
+								dependencies: [],
+							},
+						],
+					},
+				});
+				await session.prompt("/change approve");
+				await session.waitForIdle();
+
+				await session.prompt("/change abort");
+				await session.waitForIdle();
+
+				// The advisor was asked once per gate, with the artifact as state and the key as bearer.
+				expect(requests).toHaveLength(2);
+				expect(requests[0].auth).toBe("Bearer test-key");
+				expect(requests[0].body.state).toContain("greeting.txt says Hello instead of Hi");
+				expect(Object.keys(requests[0].body.questions.decision.criteria)).not.toContain("approve_push");
+				expect(requests[1].body.state).toContain("Change greeting.txt to say Hi");
+
+				const decisions = session.sessionManager
+					.getBranch()
+					.filter((e: any) => e.type === "custom" && e.customType === "code-changes-gate-decision")
+					.map((e: any) => e.data);
+				expect(decisions.map((d: any) => [d.gate, d.decision, d.via])).toEqual([
+					["analysis", "approve", "command"],
+					["plan", "stop", "command"],
+				]);
+				expect(decisions[0].advice).toMatchObject({ provider: "jev", model: "jev-test", decision: "approve", confidence: 0.88, followed: true });
+				expect(decisions[1].advice).toMatchObject({ decision: "approve", followed: false });
+				expect(decisions[1].artifact.tasks[0].id).toBe("t1");
+
+				const logged = fs.readFileSync(logFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+				expect(logged).toEqual(decisions);
+			} finally {
+				session.dispose();
+				server.close();
+				delete process.env.PI_CC_E2E_JEV_KEY;
 			}
 		},
 		TIMEOUT,

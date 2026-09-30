@@ -6,6 +6,8 @@
  * restored from the active branch on `session_start`.
  */
 
+import type { GateAdvice, GateHistoryItem, GateKind } from "./gatelog.ts";
+
 export const STATE_ENTRY = "code-changes-state";
 
 export type Phase =
@@ -254,6 +256,10 @@ export interface WorkflowState {
 	analysisEditedByHuman?: boolean;
 	/** True when the human edited the plan at the plan approval gate. */
 	planEditedByHuman?: boolean;
+	/** Human decisions at the analysis/plan gates so far in this run, oldest first. */
+	gateHistory?: GateHistoryItem[];
+	/** Gate advisor suggestion for the gate currently open, cached so a re-open does not ask again. */
+	gateAdvice?: { gate: GateKind; advice: GateAdvice };
 	/** Continuations after transient provider errors pi did not retry itself; reset on every phase change. */
 	transientRetries?: number;
 	analysis?: AnalysisReport;
