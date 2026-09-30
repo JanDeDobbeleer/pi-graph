@@ -7,9 +7,10 @@
  */
 
 import { Type, type Static } from "typebox";
+import { DEFAULT_MAX_PARALLEL } from "./delegate.ts";
 import { isSubAgentTask, planWorkspaces, topologicalWaves, worktreeTaskIds } from "./planning.ts";
 import { independent, overlappingPatterns } from "./paths.ts";
-import { transition, type WorkflowState, type PlanTask, type TaskList, type FailureRecord, type PullRequestRef, type AnalysisReport } from "./state.ts";
+import { transition, type WorkflowState, type PlanTask, type TaskList, type ExecutorTier, type FailureRecord, type PullRequestRef, type AnalysisReport } from "./state.ts";
 import type { GateResult } from "./state.ts";
 
 // ---------------------------------------------------------------------------
@@ -404,12 +405,39 @@ export function applyPlan(state: WorkflowState, plan: PlanParams): WorkflowState
 // 4a. Plan <-> Markdown (plan-approval-gate display) and <-> editable JSON (human editing round trip)
 // ---------------------------------------------------------------------------
 
+/** How the plan will run: resolved models per tier and the parallelism cap. All optional; used for display only. */
+export interface PlanExecutionOptions {
+	/** Resolved "provider/model" refs per executor tier; undefined means the session model. */
+	models: Partial<Record<ExecutorTier, string>>;
+	maxParallel: number;
+	/** Tiers whose configured model could not be resolved (they run on the session model instead). */
+	fellBack?: ExecutorTier[];
+	/** True when the main tree has uncommitted changes (worktrees branch from HEAD and will not see them). */
+	mainTreeDirty?: boolean;
+}
+
+export interface FormatPlanOptions {
+	edited?: boolean;
+	execution?: PlanExecutionOptions;
+}
+
+const MAX_LISTED_GATES = 6;
+
+function plural(n: number, one: string, many: string = `${one}s`): string {
+	return `${n} ${n === 1 ? one : many}`;
+}
+
+/** Escapes a Markdown table cell. */
+function cell(text: string): string {
+	return text.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+}
+
 /**
- * Renders a task list as Markdown for the plan-approval-gate transcript message: one heading per
- * task with its id, executor tier, workspace, dependencies, full spec, and verification commands,
- * followed by the merge plan (if any).
+ * Renders a task list as Markdown for the plan-approval-gate transcript message: an "Execution"
+ * overview first (waves, models, workspaces, parallelism, merge/verify/deliver), then one heading
+ * per task with its id, executor tier, workspace, dependencies, full spec, and verification commands.
  */
-export function formatPlan(plan: TaskList, opts?: { edited?: boolean }): string {
+export function formatPlan(plan: TaskList, opts?: FormatPlanOptions): string {
 	const lines: string[] = [];
 	lines.push("# Plan");
 	if (opts?.edited) lines.push("_(edited by you)_");
@@ -417,8 +445,9 @@ export function formatPlan(plan: TaskList, opts?: { edited?: boolean }): string 
 	try {
 		decisions = planWorkspaces(plan);
 	} catch {
-		decisions = undefined; // cyclic plan: validatePlan reports it; just skip the computed sections
+		decisions = undefined; // cyclic plan: validatePlan reports it; just skip the computed section
 	}
+	if (decisions) lines.push(...formatExecution(plan, decisions, opts?.execution));
 	for (const t of plan.tasks) {
 		lines.push("");
 		lines.push(`## Task ${t.id}`);
@@ -441,51 +470,120 @@ export function formatPlan(plan: TaskList, opts?: { edited?: boolean }): string 
 			lines.push("- (none)");
 		}
 	}
-	if (decisions) {
-		lines.push("");
-		lines.push("## Parallelism");
-		lines.push(...formatParallelism(plan, decisions));
-	}
-	lines.push("");
-	lines.push("## Merge plan");
-	const worktreeIds = decisions ? worktreeTaskIds(plan) : [];
-	if (plan.merge_plan) {
-		lines.push(`- order: ${plan.merge_plan.order.join(" -> ")}`);
-		lines.push(`- conflict owner: ${plan.merge_plan.conflict_owner}`);
-	} else if (worktreeIds.length > 1) {
-		lines.push(`- not specified: the harness merges worktree branches in plan order (${worktreeIds.join(" -> ")})`);
-	} else {
-		lines.push("- (no more than one worktree task; nothing to merge)");
-	}
 	return lines.join("\n");
 }
 
-/** Wave-by-wave description of which tasks run together and which move to worktrees. */
-function formatParallelism(plan: TaskList, decisions: ReturnType<typeof planWorkspaces>): string[] {
-	const lines: string[] = [];
-	const label = (t: PlanTask) => {
-		const d = decisions.get(t.id);
-		return `${t.id} (${d?.workspace ?? t.workspace}${d?.auto ? ", moved from main" : ""})`;
-	};
-	topologicalWaves(plan.tasks).forEach((wave, index) => {
-		const subAgent = wave.filter(isSubAgentTask);
-		const direct = wave.filter((t) => !isSubAgentTask(t));
-		const worktree = subAgent.filter((t) => decisions.get(t.id)?.workspace === "worktree");
-		const main = subAgent.filter((t) => decisions.get(t.id)?.workspace !== "worktree");
-		const parts: string[] = [];
-		if (subAgent.length > 0) {
-			const concurrent = worktree.length > 1 || (worktree.length > 0 && main.length > 0);
-			parts.push(`${subAgent.map(label).join(", ")}${concurrent ? " -- run in parallel" : subAgent.length > 1 ? " -- run one after another in the main tree" : ""}`);
-			if (concurrent && main.length > 1) parts.push("main-tree tasks in this wave run one after another");
-		}
-		if (direct.length > 0) parts.push(`coordinator-direct, run in Supervise: ${direct.map((t) => t.id).join(", ")}`);
-		lines.push(`- Wave ${index + 1}: ${parts.join("; ")}`);
-	});
-	for (const t of plan.tasks) {
-		const d = decisions.get(t.id);
-		if (d?.auto) lines.push(`- ${t.id} moves to a worktree ${d.reason}.`);
+/** The "## Execution" overview: summary counts, heads-ups, one table per wave, and the merge/verify/deliver line. */
+function formatExecution(plan: TaskList, decisions: ReturnType<typeof planWorkspaces>, exec?: PlanExecutionOptions): string[] {
+	const maxParallel = exec?.maxParallel ?? DEFAULT_MAX_PARALLEL;
+	const waves = topologicalWaves(plan.tasks);
+	const subAgent = plan.tasks.filter(isSubAgentTask);
+	const direct = plan.tasks.filter((t) => !isSubAgentTask(t));
+	const worktreeIds = worktreeTaskIds(plan);
+	const moved = worktreeIds.filter((id) => decisions.get(id)?.auto);
+	const mainSub = subAgent.filter((t) => decisions.get(t.id)?.workspace !== "worktree");
+
+	const summary = [plural(plan.tasks.length, "task"), plural(waves.length, "wave"), `up to ${maxParallel} at once`];
+	if (worktreeIds.length > 0) {
+		summary.push(`${worktreeIds.length} in worktrees${moved.length > 0 ? ` (${moved.length} moved from main)` : ""}`);
 	}
+	if (direct.length > 0) summary.push(`${direct.length} by the coordinator`);
+	if (mainSub.length > 0) summary.push(`${mainSub.length} in the main tree`);
+
+	const lines: string[] = ["", "## Execution", summary.join(" · ")];
+
+	const headsUp: string[] = [];
+	const fellBack = [...new Set(exec?.fellBack ?? [])];
+	if (fellBack.length > 0) {
+		headsUp.push(`the configured model for ${fellBack.map((t) => `\`${t}\``).join(", ")} could not be resolved; the session model is used instead`);
+	}
+	if (exec?.mainTreeDirty && worktreeIds.length > 0) {
+		headsUp.push(`the main tree has uncommitted changes; worktree tasks (${worktreeIds.join(", ")}) branch from HEAD and will not see them`);
+	}
+
+	const wavesOut: string[] = [];
+	const earlier = new Set<string>();
+	waves.forEach((wave, index) => {
+		const waveSub = wave.filter(isSubAgentTask);
+		const waveWorktree = waveSub.filter((t) => decisions.get(t.id)?.workspace === "worktree");
+		const waveMain = waveSub.filter((t) => decisions.get(t.id)?.workspace !== "worktree");
+		const concurrent = waveWorktree.length + (waveMain.length > 0 ? 1 : 0);
+		const suffix: string[] = [];
+		if (concurrent >= 2) suffix.push("parallel");
+		else if (waveMain.length > 1) suffix.push("one after another (main tree)");
+		const waveIds = new Set(wave.map((t) => t.id));
+		const deps: string[] = [];
+		for (const t of wave) {
+			for (const d of t.dependencies) if (earlier.has(d) && !waveIds.has(d) && !deps.includes(d)) deps.push(d);
+		}
+		if (deps.length > 0) suffix.push(`after ${deps.join(", ")}`);
+		for (const t of wave) earlier.add(t.id);
+
+		if (waveMain.length > 1) {
+			headsUp.push(`wave ${index + 1}: ${waveMain.map((t) => t.id).join(", ")} stay in the main tree and run one after another`);
+		}
+
+		wavesOut.push("");
+		wavesOut.push(`### Wave ${index + 1}${suffix.length > 0 ? ` — ${suffix.join(", ")}` : ""}`);
+		wavesOut.push("| task | runs on | workspace | paths |");
+		wavesOut.push("|---|---|---|---|");
+		for (const t of wave) {
+			wavesOut.push(`| ${cell(t.id)} | ${cell(runsOn(t, exec))} | ${cell(workspaceLabel(t, decisions.get(t.id)))} | ${cell(pathsLabel(t))} |`);
+		}
+		if (concurrent > maxParallel) {
+			wavesOut.push("");
+			wavesOut.push(`_${concurrent} tasks, ${maxParallel} at a time_`);
+		}
+	});
+
+	if (headsUp.length > 0) {
+		lines.push("");
+		lines.push("**Heads-up:**");
+		for (const h of headsUp) lines.push(`- ${h}`);
+	}
+	lines.push(...wavesOut);
+
+	const then: string[] = [];
+	if (worktreeIds.length > 1) {
+		const order = plan.merge_plan?.order ?? worktreeIds;
+		then.push(`squash-merge ${order.join(" → ")}${plan.merge_plan ? ` (conflicts: ${plan.merge_plan.conflict_owner})` : ""}`);
+	} else {
+		then.push("nothing to merge");
+	}
+	then.push(
+		`Supervise reviews the ${worktreeIds.length > 1 ? "merged " : ""}diff${direct.length > 0 ? ` and implements ${direct.map((t) => t.id).join(", ")}` : ""}`,
+	);
+	const gates: string[] = [];
+	for (const t of plan.tasks) for (const c of t.verification_commands) if (!gates.includes(c)) gates.push(c);
+	if (gates.length === 0) {
+		then.push("Verify runs no gates");
+	} else {
+		const listed = gates.slice(0, MAX_LISTED_GATES).map((c) => `\`${c}\``);
+		if (gates.length > MAX_LISTED_GATES) listed.push(`+${gates.length - MAX_LISTED_GATES} more`);
+		then.push(`Verify runs ${plural(gates.length, "gate")} on the ${worktreeIds.length > 1 ? "merged state" : "result"} (${listed.join(", ")})`);
+	}
+	then.push("Deliver");
+	lines.push("");
+	lines.push(`**Then:** ${then.join(" · ")}`);
 	return lines;
+}
+
+function runsOn(t: PlanTask, exec?: PlanExecutionOptions): string {
+	const name = isSubAgentTask(t) ? t.executor_tier : "coordinator";
+	if (!exec) return name;
+	const ref = exec.models[t.executor_tier];
+	const fallback = (exec.fellBack ?? []).includes(t.executor_tier);
+	return `${name} → ${ref ?? "session model"}${fallback ? " (fallback)" : ""}`;
+}
+
+function workspaceLabel(t: PlanTask, decision?: { workspace: "main" | "worktree"; auto: boolean }): string {
+	if (!isSubAgentTask(t)) return "main (in Supervise)";
+	if (decision?.workspace === "worktree") return decision.auto ? "worktree (moved from main)" : "worktree";
+	return t.requires_main_tree ? "main (requires main tree)" : "main";
+}
+
+function pathsLabel(t: PlanTask): string {
+	return t.paths && t.paths.length > 0 ? t.paths.map((p) => `\`${p}\``).join(", ") : "—";
 }
 
 const PLAN_EDIT_COMMENT = [

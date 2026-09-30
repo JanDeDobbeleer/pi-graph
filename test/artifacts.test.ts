@@ -353,7 +353,7 @@ describe("formatPlan / planToEditable / parseEditablePlan", () => {
 		expect(md).toContain("npm test");
 	});
 
-	it("formatPlan shows paths, requires_main_tree and a Parallelism section", () => {
+	it("formatPlan shows paths, requires_main_tree and an Execution section", () => {
 		const p = plan({
 			tasks: [
 				task({ id: "a", paths: ["src/a/"] }),
@@ -366,17 +366,20 @@ describe("formatPlan / planToEditable / parseEditablePlan", () => {
 		expect(md).toContain("- paths: src/a/");
 		expect(md).toContain("- paths: src/b/, docs/b.md");
 		expect(md).toContain("requires main tree");
-		expect(md).toContain("## Parallelism");
+		expect(md).toContain("## Execution");
+		expect(md).not.toContain("## Parallelism");
 		// a and b are independent in wave 1, c is pinned to the main tree so a cannot move (it must be visible to c).
-		expect(md).toMatch(/Wave 1: a \(main\), b \(worktree, moved from main\)/);
-		expect(md).toContain("b moves to a worktree to run in parallel with a");
-		expect(md).toContain("coordinator-direct, run in Supervise: d");
+		expect(md).toContain("| a | implementer | main | `src/a/` |");
+		expect(md).toContain("| b | implementer | worktree (moved from main) | `src/b/`, `docs/b.md` |");
+		expect(md).toContain("| c | implementer | main (requires main tree) | `src/c/` |");
+		expect(md).toContain("| d | coordinator | main (in Supervise) | — |");
+		expect(md).toContain("Supervise reviews the diff and implements d");
 	});
 
 	it("formatPlan lists parallel worktree tasks and the default merge order", () => {
 		const md = formatPlan(plan({ tasks: [task({ id: "a" }), task({ id: "b" })] }));
-		expect(md).toMatch(/Wave 1: a \(worktree, moved from main\), b \(worktree, moved from main\) -- run in parallel/);
-		expect(md).toContain("a -> b");
+		expect(md).toContain("### Wave 1 — parallel");
+		expect(md).toContain("squash-merge a → b");
 	});
 
 	it("formatPlan includes the merge plan when present", () => {
@@ -385,8 +388,7 @@ describe("formatPlan / planToEditable / parseEditablePlan", () => {
 			merge_plan: { order: ["a", "b"], conflict_owner: "coordinator" },
 		});
 		const md = formatPlan(p);
-		expect(md).toContain("a -> b");
-		expect(md).toContain("coordinator");
+		expect(md).toContain("squash-merge a → b (conflicts: coordinator)");
 	});
 
 	it("marks the edited-by-you note", () => {

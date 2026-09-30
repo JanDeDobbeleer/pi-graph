@@ -37,6 +37,7 @@ import {
 	buildPackets,
 	formatAnalysis,
 	formatPlan,
+	type PlanExecutionOptions,
 	parseAnalysisMarkdown,
 	parseEditablePlan,
 	planToEditable,
@@ -65,6 +66,7 @@ import {
 	type EntryKind,
 	type FailureRecord,
 	type GateResult,
+	type ExecutorTier,
 	type Phase,
 	type PullRequestRef,
 	type TaskList,
@@ -546,12 +548,34 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	// /change approve|revise|show wiring in index.ts's command handler).
 	// -------------------------------------------------------------------------
 
-	function sendPlanMessage(current: WorkflowState): void {
+	/** How the plan will run (models per tier, parallelism cap, dirty main tree). Cheap: config files and `git status` only. */
+	async function planExecutionOptions(plan: TaskList, ctx: ExtensionContext): Promise<PlanExecutionOptions> {
+		const config = loadTierConfig(ctx.cwd);
+		const models: Partial<Record<ExecutorTier, string>> = {};
+		const fellBack: ExecutorTier[] = [];
+		const tiers = new Set<ExecutorTier>(plan.tasks.map((t) => t.executor_tier));
+		for (const tier of tiers) {
+			const resolved = resolveTierModel(ctx.modelRegistry, config, tierForExecutor(tier), undefined);
+			if (resolved.ref !== undefined) models[tier] = resolved.ref;
+			if (resolved.fellBack) fellBack.push(tier);
+		}
+		let mainTreeDirty = false;
+		try {
+			const status = await git(["status", "--porcelain"], ctx.cwd);
+			mainTreeDirty = status.code === 0 && status.stdout.trim() !== "";
+		} catch {
+			mainTreeDirty = false;
+		}
+		return { models, maxParallel: loadMaxParallel(ctx.cwd), fellBack, mainTreeDirty };
+	}
+
+	async function sendPlanMessage(current: WorkflowState, ctx: ExtensionContext): Promise<void> {
 		if (!current.plan) return;
+		const execution = await planExecutionOptions(current.plan, ctx);
 		pi.sendMessage(
 			{
 				customType: "code-changes-plan",
-				content: formatPlan(current.plan, { edited: current.planEditedByHuman }),
+				content: formatPlan(current.plan, { edited: current.planEditedByHuman, execution }),
 				display: true,
 				details: current.plan,
 			},
@@ -563,7 +587,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 
 	async function openPlanApprovalGate(ctx: ExtensionContext, opts?: { resend?: boolean }): Promise<void> {
 		if (!state || state.phase !== "awaiting_plan_approval") return;
-		if ((opts?.resend ?? true) && state.plan) sendPlanMessage(state);
+		if ((opts?.resend ?? true) && state.plan) await sendPlanMessage(state, ctx);
 
 		if (!ctx.hasUI) {
 			ctx.ui.notify(NO_UI_PLAN_GATE_HINT, "info");
@@ -827,7 +851,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 					return;
 				}
 				if (state.analysis) sendAnalysisMessage(state);
-				if (state.plan) sendPlanMessage(state);
+				if (state.plan) await sendPlanMessage(state, ctx);
 				if (state.review) {
 					const lines = [
 						"# Reviewed diff summary",
@@ -931,7 +955,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 				let next = applyPlan(state, params);
 				next = { ...next, packets: buildPackets(next.plan!) };
 				setState(next, ctx);
-				const formatted = next.plan ? formatPlan(next.plan) : "";
+				const formatted = next.plan ? formatPlan(next.plan, { execution: await planExecutionOptions(next.plan, ctx) }) : "";
 				return {
 					content: [{ type: "text", text: `Plan submitted with ${next.plan?.tasks.length ?? 0} task(s). Phase is now ${PHASE_LABEL[next.phase]}.\n\n${formatted}` }],
 					details: next.plan,

@@ -297,7 +297,7 @@ The harness, not the model, decides which tasks run in parallel.
   it, so its worktree can merge those branches in; a task that (transitively) feeds a
   `requires_main_tree` task stays in the main tree. Moved runs have `TaskRun.auto_worktree = true`
   and a line in the merge log (`task X moved to a worktree to run in parallel with Y`). The plan
-  approval view shows a **Parallelism** section (waves, which tasks run together, which move).
+  approval view leads with an **Execution** overview: per wave a table of task, tier and model, workspace and paths (parallel or sequential, which tasks moved), heads-ups (model fallbacks, uncommitted main-tree changes), then merge order, gates and delivery.
 - **`requires_main_tree`**: set it only when a task needs the uncommitted changes in the main tree;
   worktrees branch from `HEAD` and do not see them. It is never moved.
 - **`merge_plan`** is optional. Since the harness decides the final workspaces, when it is omitted the
