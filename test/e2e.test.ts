@@ -226,10 +226,11 @@ describe("code-changes e2e (real pi runtime, scripted fake model)", () => {
 				queue.push({
 					tool: "submit_analysis",
 					args: {
-						root_cause: "greeting.txt says Hello instead of Hi",
+						kind: "bug",
+						findings: "greeting.txt says Hello instead of Hi",
 						proposed_change: "change the greeting text to Hi",
 						out_of_scope: "nothing else",
-						repro_status: "reproduced: read greeting.txt",
+						evidence: "reproduced: read greeting.txt",
 						open_questions: [],
 					},
 				});
@@ -400,10 +401,11 @@ describe("code-changes e2e (real pi runtime, scripted fake model)", () => {
 				queue.push({
 					tool: "submit_analysis",
 					args: {
-						root_cause: "greeting.txt says Hello instead of Hi",
+						kind: "bug",
+						findings: "greeting.txt says Hello instead of Hi",
 						proposed_change: "change the greeting text to Hi",
 						out_of_scope: "nothing else",
-						repro_status: "reproduced: read greeting.txt",
+						evidence: "reproduced: read greeting.txt",
 						open_questions: [],
 					},
 				});
@@ -465,10 +467,11 @@ describe("code-changes e2e (real pi runtime, scripted fake model)", () => {
 				queue.push({
 					tool: "submit_analysis",
 					args: {
-						root_cause: "greeting.txt says Hello instead of Hi",
+						kind: "bug",
+						findings: "greeting.txt says Hello instead of Hi",
 						proposed_change: "change the greeting text to Hi",
 						out_of_scope: "nothing else",
-						repro_status: "reproduced: read greeting.txt",
+						evidence: "reproduced: read greeting.txt",
 						open_questions: [],
 					},
 				});
@@ -495,6 +498,59 @@ describe("code-changes e2e (real pi runtime, scripted fake model)", () => {
 			} finally {
 				session.dispose();
 				resetRetrySleep();
+			}
+		},
+		TIMEOUT,
+	);
+
+	it(
+		"ends a question analysis at the gate with /change done, delivering the analysis",
+		async () => {
+			const repo = await makeTempRepo();
+			cleanupDirs.push(repo);
+			const { extension: fakeProvider, model, queue } = makeFakeProvider();
+			const session = await makeSession(repo, [fakeProvider], model);
+
+			try {
+				queue.push({
+					tool: "submit_analysis",
+					args: {
+						kind: "question",
+						findings: "The greeting lives in greeting.txt and reads Hello.",
+						proposed_change: "",
+						out_of_scope: "",
+						evidence: "read greeting.txt",
+						open_questions: [],
+					},
+				});
+
+				await session.prompt("/change where does the greeting come from?");
+				await session.waitForIdle();
+
+				// A question has no change to plan: the run parks at the gate, and /change approve is refused.
+				await session.prompt("/change approve");
+				await session.waitForIdle();
+				expect(session.messages.some((m) => (m as any).customType === "code-changes-phase-prompt" && (m as any).details?.phase === "plan")).toBe(false);
+
+				await session.prompt("/change done");
+				await session.waitForIdle();
+
+				const finalMessage = session.messages
+					.slice()
+					.reverse()
+					.find((m) => m.role !== "user" && (m as any).customType === "code-changes-phase");
+				expect(finalMessage).toBeDefined();
+				const content = (finalMessage as any).content;
+				const text = typeof content === "string" ? content : (content ?? []).map((c: any) => c.text ?? "").join(" ");
+				expect(text).toContain("Done");
+				expect(text).toContain("The greeting lives in greeting.txt and reads Hello.");
+
+				const states = session.sessionManager
+					.getBranch()
+					.filter((e: any) => e.type === "custom" && e.customType === "code-changes-state");
+				expect((states[states.length - 1] as any).data.phase).toBe("done");
+			} finally {
+				session.dispose();
 			}
 		},
 		TIMEOUT,

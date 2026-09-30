@@ -10,21 +10,54 @@ import { Type, type Static } from "typebox";
 import { DEFAULT_MAX_PARALLEL } from "./delegate.ts";
 import { isSubAgentTask, planWorkspaces, topologicalWaves, worktreeTaskIds } from "./planning.ts";
 import { independent, overlappingPatterns } from "./paths.ts";
-import { transition, type WorkflowState, type PlanTask, type TaskList, type ExecutorTier, type FailureRecord, type PullRequestRef, type AnalysisReport } from "./state.ts";
+import { transition, type WorkflowState, type PlanTask, type TaskList, type ExecutorTier, type FailureRecord, type PullRequestRef, type AnalysisReport, type AnalysisKind, type AnalysisOption, ANALYSIS_KINDS } from "./state.ts";
 import type { GateResult } from "./state.ts";
 
 // ---------------------------------------------------------------------------
 // 1. Schemas
 // ---------------------------------------------------------------------------
 
+const AnalysisOptionSchema = Type.Object({
+	id: Type.String({ description: "Short unique identifier for this option, e.g. 'A' or 'inline-cache'." }),
+	title: Type.String({ description: "One-line name of the approach." }),
+	summary: Type.String({ description: "What this approach does and which files it touches." }),
+	tradeoffs: Type.String({ description: "What it costs and what it buys compared with the other options." }),
+});
+
 export const AnalysisSchema = Type.Object({
-	root_cause: Type.String({ description: "What is happening and why, with file references." }),
-	proposed_change: Type.String({ description: "The scope of the fix, in enough detail to plan tasks from." }),
+	kind: Type.Union(
+		[
+			Type.Literal("bug"),
+			Type.Literal("feature"),
+			Type.Literal("refactor"),
+			Type.Literal("question"),
+			Type.Literal("investigation"),
+			Type.Literal("chore"),
+		],
+		{ description: "Classify the request: bug, feature, refactor, question, investigation, or chore." },
+	),
+	findings: Type.String({
+		description:
+			"By kind. bug: the root cause, with file references. feature: current behavior and where the change fits. refactor: what the current code does, as a list — it becomes the acceptance criteria. question: the answer. investigation: what was found. chore: what needs doing and where.",
+	}),
+	proposed_change: Type.String({
+		description:
+			"The scope of the change, in enough detail to plan tasks from. May be empty for a question or investigation, or when recommending no change; required for bug/feature/refactor/chore unless options are given (the human then picks one).",
+	}),
 	out_of_scope: Type.String({ description: "What is deliberately left alone." }),
-	repro_status: Type.String({ description: "Reproduced-with-evidence, or unverified-by-repro with the reason." }),
+	evidence: Type.String({
+		description:
+			"By kind. bug: reproduction, or why it could not be reproduced. feature: prior art in the code/docs. question: sources. otherwise: the evidence the findings rest on.",
+	}),
 	open_questions: Type.Array(Type.String(), {
 		description: "Anything still unresolved. Must be empty for the stop gate to clear automatically.",
 	}),
+	options: Type.Optional(
+		Type.Array(AnalysisOptionSchema, {
+			description: "Alternative approaches with trade-offs, when there is a real design choice. The human picks one at the gate.",
+		}),
+	),
+	recommendation: Type.Optional(Type.String({ description: "The id of the option you recommend. Must match one of the options." })),
 });
 export type AnalysisParams = Static<typeof AnalysisSchema>;
 
@@ -121,18 +154,42 @@ export class ArtifactError extends Error {
 // 3a. Analysis <-> Markdown (approval-gate display + human editing round trip)
 // ---------------------------------------------------------------------------
 
-const ANALYSIS_SECTION_HEADINGS: Record<keyof Omit<AnalysisReport, "open_questions">, string> = {
-	root_cause: "Root cause",
-	proposed_change: "Proposed change",
-	out_of_scope: "Out of scope",
-	repro_status: "Repro status",
+export interface AnalysisHeadings {
+	findings: string;
+	evidence: string;
+}
+
+const ANALYSIS_HEADINGS: Record<AnalysisKind, AnalysisHeadings> = {
+	bug: { findings: "Root cause", evidence: "Reproduction" },
+	feature: { findings: "Current behavior and where it fits", evidence: "Prior art" },
+	refactor: { findings: "What the current code does", evidence: "Evidence" },
+	question: { findings: "Answer", evidence: "Sources" },
+	investigation: { findings: "Findings", evidence: "Evidence" },
+	chore: { findings: "What needs doing", evidence: "Evidence" },
 };
 
-const REQUIRED_ANALYSIS_SECTIONS: Array<{ key: keyof AnalysisReport; heading: string }> = [
-	{ key: "root_cause", heading: "Root cause" },
-	{ key: "proposed_change", heading: "Proposed change" },
-	{ key: "repro_status", heading: "Repro status" },
-];
+/** The section headings `formatAnalysis` uses for the findings and evidence fields of a given kind. */
+export function analysisHeadings(kind: AnalysisKind): AnalysisHeadings {
+	return ANALYSIS_HEADINGS[kind];
+}
+
+const PROPOSED_CHANGE_HEADING = "Proposed change";
+const OUT_OF_SCOPE_HEADING = "Out of scope";
+const OPTIONS_HEADING = "Options";
+const NO_CHANGE_TEXT = "_No change proposed._";
+const OPTION_MARKS = /\s*\((recommended|chosen)\)\s*$/i;
+
+/** Kinds where a change is expected: `proposed_change` (or options to pick from) is required. */
+const CHANGE_KINDS: readonly AnalysisKind[] = ["bug", "feature", "refactor", "chore"];
+
+function isAnalysisKind(value: unknown): value is AnalysisKind {
+	return typeof value === "string" && (ANALYSIS_KINDS as readonly string[]).includes(value);
+}
+
+/** True when the analysis carries something to plan from: a proposed change, or a chosen option. */
+export function hasProposedChange(a: AnalysisReport): boolean {
+	return a.proposed_change.trim() !== "" || a.chosen_option !== undefined;
+}
 
 /**
  * Renders an analysis report as Markdown for the approval-gate transcript message and for the
@@ -140,8 +197,10 @@ const REQUIRED_ANALYSIS_SECTIONS: Array<{ key: keyof AnalysisReport; heading: st
  * they aren't missed below the other sections. `parseAnalysisMarkdown` is the inverse.
  */
 export function formatAnalysis(a: AnalysisReport, opts?: { edited?: boolean }): string {
+	const headings = analysisHeadings(a.kind);
 	const lines: string[] = [];
-	lines.push("# Analysis");
+	lines.push(`# Analysis — ${a.kind}`);
+	lines.push(`Kind: ${a.kind}`);
 	if (opts?.edited) lines.push("_(edited by you)_");
 	if (a.open_questions.length > 0) {
 		lines.push("");
@@ -149,27 +208,82 @@ export function formatAnalysis(a: AnalysisReport, opts?: { edited?: boolean }): 
 		for (const q of a.open_questions) lines.push(`- ${q}`);
 	}
 	lines.push("");
-	lines.push(`## ${ANALYSIS_SECTION_HEADINGS.root_cause}\n${a.root_cause}`);
+	lines.push(`## ${headings.findings}\n${a.findings}`);
 	lines.push("");
-	lines.push(`## ${ANALYSIS_SECTION_HEADINGS.proposed_change}\n${a.proposed_change}`);
+	lines.push(`## ${headings.evidence}\n${a.evidence}`);
 	lines.push("");
-	lines.push(`## ${ANALYSIS_SECTION_HEADINGS.out_of_scope}\n${a.out_of_scope}`);
+	lines.push(`## ${PROPOSED_CHANGE_HEADING}\n${a.proposed_change.trim() ? a.proposed_change : NO_CHANGE_TEXT}`);
+	if (a.options && a.options.length > 0) {
+		lines.push("");
+		lines.push(`## ${OPTIONS_HEADING}`);
+		for (const o of a.options) {
+			const marks = (a.recommendation === o.id ? " (recommended)" : "") + (a.chosen_option === o.id ? " (chosen)" : "");
+			lines.push(`### ${o.id} — ${o.title}${marks}`);
+			lines.push(o.summary);
+			lines.push(`Trade-offs: ${o.tradeoffs}`);
+			lines.push("");
+		}
+		while (lines[lines.length - 1] === "") lines.pop();
+	}
 	lines.push("");
-	lines.push(`## ${ANALYSIS_SECTION_HEADINGS.repro_status}\n${a.repro_status}`);
+	lines.push(`## ${OUT_OF_SCOPE_HEADING}\n${a.out_of_scope}`);
 	return lines.join("\n");
+}
+
+function parseOptions(body: string[]): { options: AnalysisOption[]; recommendation?: string; chosen?: string } {
+	const options: AnalysisOption[] = [];
+	let recommendation: string | undefined;
+	let chosen: string | undefined;
+	let current: { id: string; title: string; lines: string[] } | undefined;
+	const flush = () => {
+		if (!current) return;
+		const text = current.lines.join("\n");
+		const split = text.match(/^([\s\S]*?)(?:^|\n)[ \t]*trade-?offs?:[ \t]*([\s\S]*)$/i);
+		const summary = (split ? split[1] : text).trim();
+		const tradeoffs = (split ? split[2] : "").trim();
+		options.push({ id: current.id, title: current.title, summary, tradeoffs });
+		current = undefined;
+	};
+	for (const line of body) {
+		const heading = line.match(/^###\s+(.+?)\s*$/);
+		if (heading) {
+			flush();
+			let text = heading[1];
+			const found: string[] = [];
+			for (let marks = text.match(OPTION_MARKS); marks; marks = text.match(OPTION_MARKS)) {
+				found.push(marks[1].toLowerCase());
+				text = text.slice(0, marks.index);
+			}
+			const m = text.match(/^(\S+)(?:\s+[—–-]+\s+(.*)|\s+(.*))?$/);
+			const id = m ? m[1] : text.trim();
+			const title = (m ? (m[2] ?? m[3] ?? "") : "").trim();
+			if (found.includes("recommended")) recommendation = id;
+			if (found.includes("chosen")) chosen = id;
+			current = { id, title, lines: [] };
+			continue;
+		}
+		if (current) current.lines.push(line);
+	}
+	flush();
+	return { options, recommendation, chosen };
 }
 
 /**
  * Parses `formatAnalysis`'s Markdown back into an `AnalysisReport`. Tolerant of the human deleting
- * or reordering sections (matched by heading text, not position) and of extra prose outside any
- * `## ` section. `open_questions` are `- ` bullets under "Open questions"; missing entirely means
- * none. Throws `ArtifactError` naming any missing required section (root cause, proposed change,
- * repro status — the same fields `applyAnalysis` requires).
+ * or reordering sections (matched by heading text, not position), of any kind's heading variants
+ * (plus the neutral "Findings"/"Evidence"), and of extra prose outside any `## ` section. The kind
+ * comes from the `Kind:` line, else the title, else the headings used, else "bug". `open_questions`
+ * are `- ` bullets under "Open questions"; missing entirely means none. Options are the `### `
+ * blocks under "Options". Throws `ArtifactError` naming any missing required section (the
+ * findings and evidence sections, and Proposed change where the kind expects a change and no
+ * options are given — the same rules `applyAnalysis` enforces).
  */
 export function parseAnalysisMarkdown(md: string): AnalysisReport {
 	const lines = md.replace(/\r\n/g, "\n").split("\n");
 	const sections = new Map<string, string[]>();
 	let current: string | undefined;
+	let title: string | undefined;
+	let kindLine: string | undefined;
 	for (const line of lines) {
 		const heading = line.match(/^##\s+(.+?)\s*$/);
 		if (heading) {
@@ -179,9 +293,15 @@ export function parseAnalysisMarkdown(md: string): AnalysisReport {
 		}
 		if (/^#\s+/.test(line)) {
 			current = undefined; // top-level title (or a stray "# ..."): not a section body
+			title ??= line.replace(/^#\s+/, "").trim();
 			continue;
 		}
-		if (current) sections.get(current)!.push(line);
+		if (current) {
+			sections.get(current)!.push(line);
+		} else {
+			const k = line.match(/^\s*kind:\s*(\S+)\s*$/i);
+			if (k) kindLine ??= k[1];
+		}
 	}
 
 	const sectionText = (heading: string): string => {
@@ -190,13 +310,45 @@ export function parseAnalysisMarkdown(md: string): AnalysisReport {
 		return body.join("\n").trim();
 	};
 
-	const values: Partial<Record<keyof AnalysisReport, string>> = {};
-	const missing: string[] = [];
-	for (const { key, heading } of REQUIRED_ANALYSIS_SECTIONS) {
-		const text = sectionText(heading);
-		values[key] = text;
-		if (!text) missing.push(heading);
+	let kind: AnalysisKind | undefined;
+	if (kindLine !== undefined) {
+		const candidate = kindLine.toLowerCase();
+		if (!isAnalysisKind(candidate)) {
+			throw new ArtifactError(`Edited analysis has an unknown kind "${kindLine}"; expected one of: ${ANALYSIS_KINDS.join(", ")}.`);
+		}
+		kind = candidate;
 	}
+	if (!kind && title) {
+		const fromTitle = title.toLowerCase().match(/(?:—|–|-|:)\s*(\w+)\s*$/)?.[1];
+		if (isAnalysisKind(fromTitle)) kind = fromTitle;
+	}
+	if (!kind) {
+		// Infer from a kind-specific findings heading; bug is the historical default.
+		kind = ANALYSIS_KINDS.find((k) => k !== "investigation" && sections.has(ANALYSIS_HEADINGS[k].findings.toLowerCase())) ?? "bug";
+	}
+	const resolved: AnalysisKind = kind;
+
+	// Findings/evidence: the kind's own heading first, then any other kind's variant, then the old names.
+	const firstText = (field: keyof AnalysisHeadings): string => {
+		const candidates = [ANALYSIS_HEADINGS[resolved][field], ...ANALYSIS_KINDS.map((k) => ANALYSIS_HEADINGS[k][field])];
+		if (field === "evidence") candidates.push("Repro status");
+		for (const h of new Set(candidates)) {
+			const text = sectionText(h);
+			if (text) return text;
+		}
+		return "";
+	};
+
+	const findings = firstText("findings");
+	const evidence = firstText("evidence");
+	let proposed = sectionText(PROPOSED_CHANGE_HEADING);
+	if (proposed === NO_CHANGE_TEXT) proposed = "";
+
+	const parsedOptions = parseOptions(sections.get(OPTIONS_HEADING.toLowerCase()) ?? []);
+	const missing: string[] = [];
+	if (!findings) missing.push(analysisHeadings(resolved).findings);
+	if (!evidence) missing.push(analysisHeadings(resolved).evidence);
+	if (!proposed && CHANGE_KINDS.includes(resolved) && parsedOptions.options.length === 0) missing.push(PROPOSED_CHANGE_HEADING);
 	if (missing.length > 0) {
 		throw new ArtifactError(`Edited analysis is missing required section(s): ${missing.join(", ")}.`);
 	}
@@ -208,13 +360,58 @@ export function parseAnalysisMarkdown(md: string): AnalysisReport {
 		.map((l) => l.slice(2).trim())
 		.filter((l) => l.length > 0);
 
-	return {
-		root_cause: values.root_cause ?? "",
-		proposed_change: values.proposed_change ?? "",
-		out_of_scope: sectionText(ANALYSIS_SECTION_HEADINGS.out_of_scope),
-		repro_status: values.repro_status ?? "",
+	const report: AnalysisReport = {
+		kind: resolved,
+		findings,
+		proposed_change: proposed,
+		out_of_scope: sectionText(OUT_OF_SCOPE_HEADING),
+		evidence,
 		open_questions,
 	};
+	if (parsedOptions.options.length > 0) report.options = parsedOptions.options;
+	if (parsedOptions.recommendation !== undefined) report.recommendation = parsedOptions.recommendation;
+	if (parsedOptions.chosen !== undefined) report.chosen_option = parsedOptions.chosen;
+	return report;
+}
+
+/**
+ * Records the human's pick of one of `analysis.options`. Sets `chosen_option` and makes
+ * `proposed_change` describe the chosen option: prefixed to the existing text only when that text
+ * is non-empty and the chosen option is the recommended one; otherwise it replaces it.
+ */
+export function selectOption(analysis: AnalysisReport, optionId: string): AnalysisReport {
+	const option = analysis.options?.find((o) => o.id === optionId);
+	if (!option) {
+		const known = (analysis.options ?? []).map((o) => o.id);
+		throw new ArtifactError(
+			`Unknown option "${optionId}"${known.length > 0 ? `; choose one of: ${known.join(", ")}` : "; this analysis has no options"}.`,
+		);
+	}
+	const prefix = `Chosen option ${option.id} — ${option.title}: ${option.summary}`;
+	const previous = analysis.proposed_change.trim();
+	let proposed = prefix;
+	if (previous && analysis.recommendation === option.id) proposed = previous.startsWith(prefix) ? previous : `${prefix}\n\n${previous}`;
+	return { ...analysis, chosen_option: option.id, proposed_change: proposed };
+}
+
+/** Gate entry for picking an option; the option id follows the prefix. */
+const GO_WITH = "Go with ";
+
+/** The entries of the analysis approval gate's select, in display order. Pure, so tests can pin it. */
+export function analysisGateChoices(a: AnalysisReport): string[] {
+	const choices: string[] = [];
+	for (const o of a.options ?? []) {
+		choices.push(`${GO_WITH}${o.id} — ${o.title}${a.recommendation === o.id ? " (recommended)" : ""}`);
+	}
+	if (hasProposedChange(a)) choices.push("Approve", "Approve and allow push/PR");
+	choices.push("Edit the analysis myself", "Send feedback to revise", "Done — no implementation", "Stop the run");
+	return choices;
+}
+
+/** The option id behind a "Go with ..." gate entry, or undefined for any other entry. */
+export function optionIdFromChoice(a: AnalysisReport, choice: string): string | undefined {
+	if (!choice.startsWith(GO_WITH)) return undefined;
+	return a.options?.find((o) => choice.startsWith(`${GO_WITH}${o.id} — `))?.id;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,29 +422,48 @@ export function applyAnalysis(state: WorkflowState, a: AnalysisParams): Workflow
 	if (state.phase !== "analyze") {
 		throw new ArtifactError(`Cannot submit an analysis report while in phase "${state.phase}"; expected "analyze".`);
 	}
+	if (!isAnalysisKind(a.kind)) {
+		throw new ArtifactError(`Analysis report has an invalid kind "${String(a.kind)}"; expected one of: ${ANALYSIS_KINDS.join(", ")}.`);
+	}
+	const options = a.options ?? [];
 	const missing: string[] = [];
-	if (!a.root_cause.trim()) missing.push("root_cause");
-	if (!a.proposed_change.trim()) missing.push("proposed_change");
-	if (!a.repro_status.trim()) missing.push("repro_status");
+	if (!a.findings.trim()) missing.push("findings");
+	if (!a.evidence.trim()) missing.push("evidence");
+	if (!a.proposed_change.trim() && CHANGE_KINDS.includes(a.kind) && options.length === 0) missing.push("proposed_change");
 	if (missing.length > 0) {
-		throw new ArtifactError(`Analysis report is missing required field(s): ${missing.join(", ")}.`);
+		const hint = missing.includes("proposed_change") ? ` A ${a.kind} needs a proposed_change, or options for the human to choose from.` : "";
+		throw new ArtifactError(`Analysis report is missing required field(s): ${missing.join(", ")}.${hint}`);
 	}
 
-	let rootCause = a.root_cause;
+	const ids = options.map((o) => o.id.trim());
+	if (ids.some((id) => !id)) throw new ArtifactError("Analysis options must each have a non-empty id.");
+	const dupes = ids.filter((id, i) => ids.indexOf(id) !== i);
+	if (dupes.length > 0) throw new ArtifactError(`Analysis options have duplicate id(s): ${[...new Set(dupes)].join(", ")}.`);
+	if (a.recommendation !== undefined && !options.some((o) => o.id === a.recommendation)) {
+		throw new ArtifactError(
+			`Analysis recommendation "${a.recommendation}" does not match an option id${ids.length > 0 ? ` (${ids.join(", ")})` : " (no options were given)"}.`,
+		);
+	}
+
+	let findings = a.findings;
 	const pending = state.escalations.filter((e) => e.phase === "analyze");
 	if (pending.length > 0) {
 		const folded = pending.map((e) => `- Q: ${e.question} -> A: ${e.decision}`).join("\n");
-		rootCause = `${rootCause}\n\nEscalation decisions:\n${folded}`;
+		findings = `${findings}\n\nEscalation decisions:\n${folded}`;
 	}
 
-	const analysis = { ...a, root_cause: rootCause };
+	let analysis: AnalysisReport = { ...a, findings };
 	// A Verify bounce back to Analyze (wrong_root_cause) must re-arm the human stop gate even on a
 	// preApproved run: verify.md — "Re-entering Phase 1 re-arms its stop gate." `state.failures`
 	// being non-empty means this analysis follows at least one Verify attempt, so it always goes
-	// through approval again.
-	const next =
-		state.preApproved && a.open_questions.length === 0 && state.failures.length === 0 ? "plan" : "awaiting_approval";
-	return transition({ ...state, analysis }, next);
+	// through approval again. A run only auto-advances when there is a change to plan from: a
+	// proposed change, or a recommendation to take. Questions and investigations stop at the gate.
+	const canAdvance = a.proposed_change.trim() !== "" || a.recommendation !== undefined;
+	const advance = state.preApproved && a.open_questions.length === 0 && state.failures.length === 0 && canAdvance;
+	if (advance && a.proposed_change.trim() === "" && a.recommendation !== undefined) {
+		analysis = selectOption(analysis, a.recommendation);
+	}
+	return transition({ ...state, analysis }, advance ? "plan" : "awaiting_approval");
 }
 
 // ---------------------------------------------------------------------------
@@ -907,10 +1123,15 @@ export function summarizeState(state: WorkflowState): string {
 	if (state.analysis) {
 		lines.push("");
 		lines.push("## Analysis");
-		lines.push(`- root_cause: ${truncate(state.analysis.root_cause, 600)}`);
-		lines.push(`- proposed_change: ${truncate(state.analysis.proposed_change, 400)}`);
+		lines.push(`- kind: ${state.analysis.kind}`);
+		lines.push(`- findings: ${truncate(state.analysis.findings, 600)}`);
+		lines.push(`- proposed_change: ${truncate(state.analysis.proposed_change, 400) || "(none)"}`);
 		lines.push(`- out_of_scope: ${truncate(state.analysis.out_of_scope, 200)}`);
-		lines.push(`- repro_status: ${truncate(state.analysis.repro_status, 200)}`);
+		lines.push(`- evidence: ${truncate(state.analysis.evidence, 200)}`);
+		if (state.analysis.options?.length) {
+			const { options, recommendation, chosen_option } = state.analysis;
+			lines.push(`- options: ${options.map((o) => o.id).join(", ")}${recommendation ? ` (recommended: ${recommendation})` : ""}${chosen_option ? ` (chosen: ${chosen_option})` : ""}`);
+		}
 		if (state.analysis.open_questions.length > 0) {
 			lines.push(`- open_questions: ${state.analysis.open_questions.join("; ")}`);
 		}

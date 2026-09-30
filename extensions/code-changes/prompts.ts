@@ -21,7 +21,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { requiredGateCommands, summarizeState } from "./artifacts.ts";
 import { PHASE_ARTIFACT_TOOL, PHASE_TOOLS } from "./gates.ts";
-import { PHASE_LABEL, type Phase, type WorkflowState } from "./state.ts";
+import { PHASE_LABEL, type AnalysisKind, type Phase, type WorkflowState } from "./state.ts";
 
 // ---------------------------------------------------------------------------
 // Skill directory resolution
@@ -61,6 +61,24 @@ const ENFORCED_BLOCK = /<!-- harness:enforced -->[\s\S]*?<!-- \/harness:enforced
 export function stripEnforced(markdown: string): string {
 	const stripped = markdown.replace(ENFORCED_BLOCK, "");
 	return stripped.replace(/(\r?\n){3,}/g, "\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// kind section selection (analyze.md)
+// ---------------------------------------------------------------------------
+
+// `<!-- kind:bug -->` … `<!-- /kind:bug -->`: the per-kind guidance in analyze.md. Standalone readers
+// see all of it (HTML comments are invisible); the harness narrows it once the kind is known.
+const KIND_BLOCK = /<!-- kind:(\w+) -->\r?\n?([\s\S]*?)<!-- \/kind:\1 -->\r?\n?/g;
+
+/**
+ * Resolves the `<!-- kind:<name> -->` blocks of `markdown`. With `kind` undefined every block is
+ * kept and only its marker comments are removed; with a kind, only that kind's block is kept and
+ * the others are dropped. Runs of 3+ blank lines left behind collapse to 2.
+ */
+export function selectKindSections(markdown: string, kind: AnalysisKind | undefined): string {
+	const resolved = markdown.replace(KIND_BLOCK, (_match, name: string, body: string) => (kind === undefined || kind === name ? body : ""));
+	return resolved.replace(/(\r?\n){3,}/g, "\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -181,8 +199,16 @@ function phaseExtra(state: WorkflowState): string | undefined {
 				"Edit and write are blocked in this phase. When the analysis report is submitted, a human must approve it (or revise it) before Plan begins.",
 				EXTERNAL_CONTEXT_LINE,
 			];
+			lines.push(
+				"Classify the request first — bug, feature, refactor, question, investigation, or chore — set `kind` accordingly, and follow that kind's section of the reference. " +
+					"When there is a real design choice (feature and refactor especially), offer `options` with trade-offs and recommend one; otherwise leave them out. " +
+					"`proposed_change` may be empty for a question or investigation: the human can end the run at the approval gate with the analysis itself as the deliverable, no implementation required.",
+			);
+			if (state.analysis) {
+				lines.push(`The previous analysis was classified as "${state.analysis.kind}"; keep that kind unless the feedback changes what is being asked.`);
+			}
 			if (state.entry === "issue-triage") {
-				lines.push("This is bare triage: the human may end the run at the approval gate with the analysis itself as the deliverable — no implementation required.");
+				lines.push("This is bare triage: the analysis itself is the expected deliverable.");
 			}
 			return lines.join("\n");
 		}
@@ -277,7 +303,7 @@ export function phasePrompt(state: WorkflowState, extra?: string): string {
 	for (const name of references) {
 		lines.push("");
 		lines.push(`## Reference: ${name}.md`);
-		lines.push(readReference(name));
+		lines.push(name === "analyze" ? selectKindSections(readReference(name), state.analysis?.kind) : readReference(name));
 	}
 
 	lines.push("");

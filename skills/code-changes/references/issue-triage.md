@@ -26,10 +26,13 @@ An analysis report to the user:
    environment problem).
 4. Suggested reply to the issue when the finding should be communicated upstream.
 
-This maps onto the same `root_cause` / `proposed_change` / `out_of_scope` / `repro_status` /
+This maps onto the same `kind` / `findings` / `proposed_change` / `out_of_scope` / `evidence` /
 `open_questions` artifact Phase 1 produces — see [artifacts.md](artifacts.md) — so Plan can pick it
-up unchanged.
+up unchanged. The kind is usually `bug`: `findings` is the root cause, `evidence` is the
+reproduction. An issue that is really a feature request, a question, or a chore gets that kind
+instead, with the matching findings.
 
 ## Gate
 
-This is the Phase 1 stop gate: implement only on go, then continue from Phase 2.
+This is the Phase 1 stop gate: implement only on go, then continue from Phase 2. The human can
+also end the run there, with the analysis as the deliverable.

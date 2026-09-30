@@ -42,12 +42,35 @@ export type Tier = "escalation" | "coordinator" | "implementer" | "trivial";
 export type ExecutorTier = "trivial" | "implementer" | "coordinator-direct";
 
 // Analyze → Plan
+/** What kind of request the analysis found; selects headings, guidance and whether a change is expected. */
+export type AnalysisKind = "bug" | "feature" | "refactor" | "question" | "investigation" | "chore";
+
+export const ANALYSIS_KINDS: readonly AnalysisKind[] = ["bug", "feature", "refactor", "question", "investigation", "chore"];
+
+/** A candidate approach the human can pick at the gate. */
+export interface AnalysisOption {
+	id: string;
+	title: string;
+	summary: string;
+	tradeoffs: string;
+}
+
 export interface AnalysisReport {
-	root_cause: string;
+	kind: AnalysisKind;
+	/** Bug: root cause. Feature: current behavior and where it fits. Refactor: what the current code does. Question: the answer. */
+	findings: string;
+	/** Scope of the change to plan from; may be empty for question/investigation (nothing to implement). */
 	proposed_change: string;
 	out_of_scope: string;
-	repro_status: string;
+	/** Bug: reproduction. Feature: prior art. Question: sources. Otherwise the evidence the findings rest on. */
+	evidence: string;
 	open_questions: string[];
+	/** Alternative approaches with trade-offs, when there is a real choice to make. */
+	options?: AnalysisOption[];
+	/** Id of the recommended option. */
+	recommendation?: string;
+	/** Id of the option the human picked at the gate. */
+	chosen_option?: string;
 }
 
 // Plan → Delegate
@@ -300,8 +323,27 @@ export function restoreState(branch: ReadonlyArray<{ type: string; customType?: 
 	for (let i = branch.length - 1; i >= 0; i--) {
 		const entry = branch[i];
 		if (entry.type === "custom" && entry.customType === STATE_ENTRY) {
-			return entry.data as WorkflowState | undefined;
+			return migrateState(entry.data as WorkflowState | undefined);
 		}
 	}
 	return undefined;
+}
+
+/** Upgrades state persisted by older versions (analysis used root_cause / repro_status, no kind). */
+export function migrateState(state: WorkflowState | undefined): WorkflowState | undefined {
+	const analysis = state?.analysis as (Partial<AnalysisReport> & { root_cause?: string; repro_status?: string }) | undefined;
+	if (!state || !analysis || analysis.kind !== undefined) return state;
+	const { root_cause, repro_status, ...rest } = analysis;
+	return {
+		...state,
+		analysis: {
+			...rest,
+			kind: "bug",
+			findings: rest.findings ?? root_cause ?? "",
+			evidence: rest.evidence ?? repro_status ?? "",
+			proposed_change: rest.proposed_change ?? "",
+			out_of_scope: rest.out_of_scope ?? "",
+			open_questions: rest.open_questions ?? [],
+		},
+	};
 }

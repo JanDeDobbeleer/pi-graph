@@ -55,7 +55,11 @@ pi -e ./extensions/code-changes/index.ts
 /change show                     re-print the current analysis/plan/review (re-opens the active
                                  gate, analysis or plan, when there's UI)
 /change approve                  approve the analysis or the plan (whichever gate is open),
-                                 continue to Plan or Delegate respectively
+                                 continue to Plan or Delegate respectively (an analysis with
+                                 no proposed change needs /change choose or /change done)
+/change choose <option-id>      pick one of the analysis's options and approve it (analysis gate)
+/change done                     end the run at the analysis gate: the analysis is the
+                                 deliverable, nothing is implemented
 /change revise <feedback>        send the analysis or plan (whichever gate is open) back to
                                  Analyze/Plan with feedback
 /change abort                    stop the run and clean up worktrees
@@ -65,12 +69,37 @@ pi -e ./extensions/code-changes/index.ts
                                  gate) after an interruption, resetting the transient-retry counter
 ```
 
-At the Analyze approval gate, the human picks one of: **Approve**; **Approve and allow push/PR**
-(same as approve, plus `/change allow-push`); **Edit the analysis myself** (opens an editor
-pre-filled with the analysis — the edits become the approved artifact, recorded as
-`analysisEditedByHuman`); **Send feedback to revise** (same as `/change revise`); **Done — triage
-only** (issue-triage entry only: end the run here with the analysis as the deliverable, no
-implementation); or **Stop**.
+Analyze works for any request, not only bugs. The model first classifies it as one of six kinds
+and reports accordingly:
+
+| Kind | Findings | Evidence | Change expected |
+|---|---|---|---|
+| `bug` | "Root cause" | "Reproduction" | yes |
+| `feature` | "Current behavior and where it fits" | "Prior art" | yes, or options to pick from |
+| `refactor` | "What the current code does" (a list; it becomes the acceptance criteria) | "Evidence" | yes |
+| `question` | "Answer" | "Sources" | no |
+| `investigation` | "Findings" | "Evidence" | no |
+| `chore` | "What needs doing" | "Evidence" | yes |
+
+The analysis also carries `proposed_change`, `out_of_scope`, `open_questions`, and, when there is a
+real design choice, `options` (each with `id`, `title`, `summary`, `tradeoffs`) plus a
+`recommendation` (an option id). `proposed_change` may be empty for a question or investigation, or
+when the recommendation is to change nothing; for the other kinds it is required unless options
+are given. The rendered analysis starts `# Analysis — <kind>` with an editable `Kind:` line, and
+its findings and evidence sections use the kind's headings (the parser accepts any kind's heading,
+plus the neutral "Findings"/"Evidence"). Sessions saved before this change (with `root_cause` and
+`repro_status`) migrate on restore to `kind: bug`, `findings`, `evidence`.
+
+At the Analyze approval gate ("Review the `<kind>` analysis above"), the human picks one of: **Go
+with `<id>` — `<title>`** (one entry per option, the recommended one marked; records the choice and
+continues to Plan, like `/change choose <id>`); **Approve** and **Approve and allow push/PR**
+(same as approve, plus `/change allow-push`; only offered when a change is proposed or an option
+was chosen); **Edit the analysis myself** (opens an editor pre-filled with the analysis — the edits
+become the approved artifact, recorded as `analysisEditedByHuman`); **Send feedback to revise**
+(same as `/change revise`); **Done — no implementation** (any kind: end the run here with the
+analysis as the deliverable; same as `/change done`); or **Stop the run**. A `--approved` run
+skips the gate only when the analysis has a proposed change (or a recommendation to take), no open
+questions, and no earlier Verify failure; a question or investigation always stops at the gate.
 
 Plan ends with its own gate, right after `submit_plan`, mirroring the analysis gate: **Approve —
 start delegation**; **Edit the plan myself** (opens an editor pre-filled with the plan as JSON,

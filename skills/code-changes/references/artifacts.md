@@ -12,11 +12,24 @@ Produced by Phase 1, or by either special-case entry point (issue triage, PR rev
 all three must emit this exact shape so Plan never has to know which door the task came in
 through.
 
-- `root_cause`: what is happening and why, with file references.
-- `proposed_change`: the scope of the fix, in enough detail to plan tasks from.
+- `kind`: what the request is — `bug`, `feature`, `refactor`, `question`, `investigation`, or
+  `chore`.
+- `findings`: by kind. Bug: the root cause, with file references. Feature: current behavior and
+  where the change fits. Refactor: what the current code does, as a list (it becomes the
+  acceptance criteria). Question: the answer. Investigation: what was found. Chore: what needs
+  doing and where.
+- `proposed_change`: the scope of the change, in enough detail to plan tasks from. May be empty
+  for a question or an investigation, or when the recommendation is to change nothing; required
+  for the other kinds unless `options` are given and the human picks one.
 - `out_of_scope`: what is deliberately left alone.
-- `repro_status`: reproduced-with-evidence, or unverified-by-repro with the reason.
+- `evidence`: by kind. Bug: the reproduction, or why it is unreproducible. Feature: prior art in
+  the code and docs. Question: sources. Otherwise: the evidence the findings rest on.
 - `open_questions`: anything still unresolved (should be empty after the stop gate clears).
+- `options` (optional): alternative approaches, each with an `id`, `title`, `summary`, and
+  `tradeoffs`, when there is a real design choice.
+- `recommendation` (optional): the `id` of the option you recommend.
+
+Any kind can end at the stop gate: the analysis itself is then the deliverable and no plan follows.
 
 ## Plan → Delegate: the task list
 
@@ -87,7 +100,7 @@ the whole task:
   and why it's uncertain.
 - **Answer out:** the decision and its rationale. Control and ownership return to the phase that
   asked; the answer is folded into that phase's own artifact (e.g., an escalation answered during
-  Analyze becomes part of `root_cause`, not a separate deliverable).
+  Analyze becomes part of `findings`, not a separate deliverable).
 <!-- /harness:enforced -->
 
 ## Why this matters

@@ -33,16 +33,20 @@ import {
 	applyDelivery,
 	applyPlan,
 	applyReview,
+	analysisGateChoices,
 	applyVerification,
 	buildPackets,
 	formatAnalysis,
+	hasProposedChange,
 	formatPlan,
 	type PlanExecutionOptions,
 	parseAnalysisMarkdown,
+	optionIdFromChoice,
 	parseEditablePlan,
 	planToEditable,
 	requiredGateCommands,
 	resolveEscalatedFailure,
+	selectOption,
 	validateCommitSubjects,
 } from "./artifacts.ts";
 import { CiWatcher, detectPrFromText, formatCiFailure, isPushCommand, resolvePr, type WatchResult } from "./ci.ts";
@@ -455,7 +459,23 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		);
 	}
 
-	const NO_UI_GATE_HINT = "code-changes: analysis ready. Run /change approve, /change show or /change revise <feedback>.";
+	const NO_UI_GATE_HINT = "code-changes: analysis ready. Run /change approve (or /change choose <option-id>), /change done, /change show or /change revise <feedback>.";
+
+	/** Ends the run at the analysis gate with the analysis itself as the deliverable. */
+	async function finishWithAnalysis(ctx: ExtensionContext): Promise<void> {
+		if (!state || state.phase !== "awaiting_approval" || !state.analysis) return;
+		const report = `Analysis complete — no implementation performed.\n\n${formatAnalysis(state.analysis, { edited: state.analysisEditedByHuman })}`;
+		const withDelivery = {
+			...state,
+			delivery: {
+				commits: [],
+				no_commit_reason: `${state.analysis.kind} analysis: the analysis is the deliverable, no implementation was performed.`,
+				report,
+			},
+		};
+		setState(transition(withDelivery, "done"), ctx);
+		await enterPhase(ctx);
+	}
 
 	async function openApprovalGate(ctx: ExtensionContext, opts?: { resend?: boolean }): Promise<void> {
 		if (!state || state.phase !== "awaiting_approval") return;
@@ -466,16 +486,22 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			return;
 		}
 
-		const options = ["Approve", "Approve and allow push/PR", "Edit the analysis myself", "Send feedback to revise"];
-		if (state.entry === "issue-triage") options.push("Done — triage only");
-		options.push("Stop the run");
+		const options = analysisGateChoices(state.analysis!);
 
-		const choice = await ctx.ui.select("Review the analysis above — what next?", options);
+		const choice = await ctx.ui.select(`Review the ${state.analysis!.kind} analysis above — what next?`, options);
 		if (!state || state.phase !== "awaiting_approval") return; // state moved on while the dialog was open
 
 		if (choice === undefined) {
 			ctx.ui.notify(`code-changes: run /change approve, /change show or /change revise <feedback>.`, "info");
 			return; // cancelled: leave the run awaiting
+		}
+
+		const optionId = optionIdFromChoice(state.analysis!, choice);
+		if (optionId !== undefined) {
+			const picked = { ...state, analysis: selectOption(state.analysis!, optionId) };
+			setState(transition(picked, "plan"), ctx);
+			await enterPhase(ctx);
+			return;
 		}
 
 		if (choice === "Approve") {
@@ -520,18 +546,8 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			return;
 		}
 
-		if (choice === "Done — triage only") {
-			const report = `Triage complete — no implementation performed.\n\n${formatAnalysis(state.analysis!, { edited: state.analysisEditedByHuman })}`;
-			const withDelivery = {
-				...state,
-				delivery: {
-					commits: [],
-					no_commit_reason: "issue-triage entry: the analysis is the deliverable, no implementation was performed.",
-					report,
-				},
-			};
-			setState(transition(withDelivery, "done"), ctx);
-			await enterPhase(ctx);
+		if (choice === "Done — no implementation") {
+			await finishWithAnalysis(ctx);
 			return;
 		}
 
@@ -650,7 +666,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	// /change command
 	// -------------------------------------------------------------------------
 
-	const SUBCOMMANDS = ["status", "approve", "revise", "abort", "cleanup", "watch", "show", "triage", "review", "allow-push", "resume"];
+	const SUBCOMMANDS = ["status", "approve", "revise", "abort", "cleanup", "watch", "show", "triage", "review", "allow-push", "resume", "choose", "done"];
 
 	/** Parses `--approved`/`--push` flags (any order, any combination) preceding the rest of the args. */
 	function parseFlags(args: string): { preApproved: boolean; pushAllowed: boolean; remainder: string } {
@@ -714,7 +730,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	pi.registerCommand("change", {
 		description:
 			"Start or control the code-changes workflow: /change [--approved] [--push] <task>, /change triage|review [--approved] [--push] <ref>, " +
-			"or status/approve/revise/abort/cleanup/watch/show/allow-push/resume",
+			"or status/approve/choose/done/revise/abort/cleanup/watch/show/allow-push/resume",
 		getArgumentCompletions(argumentPrefix: string) {
 			return SUBCOMMANDS.filter((s) => s.startsWith(argumentPrefix)).map((s) => ({ value: s, label: s }));
 		},
@@ -740,12 +756,51 @@ export default function codeChanges(pi: ExtensionAPI): void {
 					ctx.ui.notify("code-changes: nothing is awaiting approval.", "warning");
 					return;
 				}
-				if (state.phase === "awaiting_approval") {
+					if (state.phase === "awaiting_approval") {
+					if (state.analysis && !hasProposedChange(state.analysis)) {
+						ctx.ui.notify(
+							state.analysis.options?.length
+								? `code-changes: no change is proposed yet; pick an option with /change choose <id> (${state.analysis.options.map((o) => o.id).join(", ")}), or /change revise <feedback>.`
+								: "code-changes: no change is proposed; use /change done to end the run with the analysis, or /change revise <feedback>.",
+							"warning",
+						);
+						return;
+					}
 					setState(transition(state, "plan"), ctx);
 				} else {
 					setState(transition(state, "delegate"), ctx);
 				}
 				await enterPhase(ctx);
+				return;
+			}
+
+			if (first === "choose") {
+				if (!state || state.phase !== "awaiting_approval" || !state.analysis) {
+					ctx.ui.notify("code-changes: /change choose only applies while the analysis is awaiting approval.", "warning");
+					return;
+				}
+				if (!restText) {
+					const ids = state.analysis.options?.map((o) => o.id).join(", ");
+					ctx.ui.notify(`code-changes: usage: /change choose <option-id>${ids ? ` (${ids})` : " — this analysis has no options"}`, "warning");
+					return;
+				}
+				try {
+					const picked = { ...state, analysis: selectOption(state.analysis, restText) };
+					setState(transition(picked, "plan"), ctx);
+				} catch (err) {
+					ctx.ui.notify(`code-changes: ${err instanceof Error ? err.message : String(err)}`, "warning");
+					return;
+				}
+				await enterPhase(ctx);
+				return;
+			}
+
+			if (first === "done") {
+				if (!state || state.phase !== "awaiting_approval" || !state.analysis) {
+					ctx.ui.notify("code-changes: /change done only applies while the analysis is awaiting approval.", "warning");
+					return;
+				}
+				await finishWithAnalysis(ctx);
 				return;
 			}
 
@@ -899,7 +954,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			const { preApproved, pushAllowed, remainder: task } = parseFlags(trimmed);
 			if (!task) {
 				ctx.ui.notify(
-					"code-changes: usage: /change [--approved] [--push] <task>, or /change status|approve|revise|abort|cleanup|watch|show|triage|review|allow-push|resume",
+					"code-changes: usage: /change [--approved] [--push] <task>, or /change status|approve|choose|done|revise|abort|cleanup|watch|show|triage|review|allow-push|resume",
 					"warning",
 				);
 				return;
@@ -916,9 +971,10 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		name: "submit_analysis",
 		label: "Submit analysis",
 		description:
-			"Submit the analysis report (root_cause, proposed_change, out_of_scope, repro_status, open_questions) to end the Analyze phase. " +
-			"For the pr-review-comments entry, map the review classification onto the same fields: root_cause/proposed_change is the " +
-			"valid-comment list with its code evidence, out_of_scope is the invalid comments (named explicitly), repro_status is the " +
+			"Submit the analysis report (kind, findings, proposed_change, out_of_scope, evidence, open_questions, optional options + recommendation) to end the Analyze phase. " +
+			"Classify the request first (bug, feature, refactor, question, investigation, chore); proposed_change may be empty for a question or investigation. " +
+			"For the pr-review-comments entry, map the review classification onto the same fields: findings/proposed_change is the " +
+			"valid-comment list with its code evidence, out_of_scope is the invalid comments (named explicitly), evidence is the " +
 			"code-path confirmation used to classify each comment, and open_questions is empty once every thread is classified.",
 		parameters: AnalysisSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

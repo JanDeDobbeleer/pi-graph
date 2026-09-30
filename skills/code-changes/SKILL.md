@@ -51,8 +51,8 @@ coordinator is equipped to make itself.
 
 ## The flow
 
-1. **Analyze** ([references/analyze.md](references/analyze.md)) — root cause and scope, validated against the code,
-   never against the report alone.
+1. **Analyze** ([references/analyze.md](references/analyze.md)) — understand the request — bug, feature, refactor,
+   question, investigation, or chore — validated against the code, never against the report alone.
 2. **Plan** ([references/plan.md](references/plan.md)) — pinned spec, task split, parallel vs sequential, workspace per
    task. Ends with its own stop gate: report the plan and wait for a go before delegating.
 3. **Delegate** ([references/delegate.md](references/delegate.md)) — match each task to the right executor,

@@ -5,9 +5,10 @@ issue analysis; Phases 2–6 apply unchanged, including the stop gate, the merge
 and Deliver's push policy — this special case does not opt out of any of them.
 
 For each valid comment, the classification below (valid/invalid, with the code evidence) stands in
-for the full analysis-report artifact from [artifacts.md](artifacts.md): `root_cause` /
+for the full analysis-report artifact from [artifacts.md](artifacts.md): `kind`
+reflects the dominant change (`chore` or `bug` per comment set), `findings` /
 `proposed_change` is the valid-comment list with its code evidence, `out_of_scope` is the invalid
-comments (named explicitly, not silently dropped), `repro_status` is the code-path confirmation
+comments (named explicitly, not silently dropped), `evidence` is the code-path confirmation
 used to classify each comment, and `open_questions` is empty once every thread is classified. Plan
 still pins a spec from this and the stop gate still applies before any fixup is written, even when
 the fix itself is small.

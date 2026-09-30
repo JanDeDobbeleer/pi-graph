@@ -1,8 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { newState, type WorkflowState } from "../extensions/code-changes/state.ts";
-import { phasePrompt, phaseReminder, readReference, referencesForPhase, SKILL_DIR, stripEnforced } from "../extensions/code-changes/prompts.ts";
+import { ANALYSIS_KINDS, newState, type AnalysisKind, type WorkflowState } from "../extensions/code-changes/state.ts";
+import { phasePrompt, phaseReminder, readReference, referencesForPhase, selectKindSections, SKILL_DIR, stripEnforced } from "../extensions/code-changes/prompts.ts";
 
 function stateInPhase(phase: WorkflowState["phase"], overrides: Partial<WorkflowState> = {}): WorkflowState {
 	const s = newState("fix the thing", ["read", "edit", "bash"], "deadbeef");
@@ -120,6 +120,95 @@ describe("referencesForPhase", () => {
 	});
 });
 
+describe("selectKindSections", () => {
+	const doc = [
+		"intro",
+		"<!-- kind:bug -->",
+		"## Bug",
+		"bug text",
+		"<!-- /kind:bug -->",
+		"",
+		"<!-- kind:feature -->",
+		"## Feature",
+		"feature text",
+		"<!-- /kind:feature -->",
+		"",
+		"outro",
+	].join("\n");
+
+	it("keeps every section and strips only the markers when the kind is unknown", () => {
+		const out = selectKindSections(doc, undefined);
+		expect(out).toContain("bug text");
+		expect(out).toContain("feature text");
+		expect(out).toContain("intro");
+		expect(out).toContain("outro");
+		expect(out).not.toContain("kind:");
+	});
+
+	it("keeps only the requested kind's section plus the common parts", () => {
+		const out = selectKindSections(doc, "feature");
+		expect(out).toContain("feature text");
+		expect(out).not.toContain("bug text");
+		expect(out).toContain("intro");
+		expect(out).toContain("outro");
+		expect(out).not.toContain("kind:");
+		expect(out).not.toMatch(/\n{3,}/);
+	});
+
+	it("drops every section for a kind the document does not cover, and tolerates CRLF", () => {
+		expect(selectKindSections(doc.replace(/\n/g, "\r\n"), "chore")).not.toMatch(/bug text|feature text/);
+		expect(selectKindSections(doc.replace(/\n/g, "\r\n"), "bug")).toContain("bug text");
+	});
+
+	it("is a no-op for a document without kind markers", () => {
+		expect(selectKindSections("plain\n\ntext", "bug")).toBe("plain\n\ntext");
+	});
+});
+
+describe("analyze.md kind sections", () => {
+	function analyzePrompt(kind?: AnalysisKind): string {
+		const analysis = kind
+			? { kind, findings: "f", proposed_change: "p", out_of_scope: "", evidence: "e", open_questions: [] }
+			: undefined;
+		return phasePrompt(stateInPhase("analyze", { analysis }));
+	}
+
+	it("injects every kind's section on first entry, without marker comments", () => {
+		const text = analyzePrompt();
+		expect(text).toContain("Classify the request");
+		for (const heading of ["## Bug", "## Feature", "## Refactor", "## Question", "## Investigation", "## Chore"]) {
+			expect(text).toContain(heading);
+		}
+		expect(text).not.toContain("<!-- kind:");
+	});
+
+	it("injects only the known kind's section on re-entry", () => {
+		const text = analyzePrompt("feature");
+		expect(text).toContain("## Feature");
+		expect(text).toContain("Classify the request");
+		expect(text).toContain("When to escalate");
+		for (const heading of ["## Bug", "## Refactor", "## Question", "## Investigation", "## Chore"]) {
+			expect(text).not.toContain(heading);
+		}
+		expect(text).toContain('classified as "feature"');
+	});
+
+	it("tells the model to classify, offer options, and that a change may be empty", () => {
+		const text = analyzePrompt();
+		expect(text).toContain("Classify the request first");
+		expect(text).toContain("`options`");
+		expect(text).toContain("`proposed_change` may be empty");
+	});
+
+	it("has a marked section for every analysis kind in the raw file", () => {
+		const raw = fs.readFileSync(path.join(SKILL_DIR, "references", "analyze.md"), "utf8");
+		for (const kind of ANALYSIS_KINDS) {
+			expect(raw).toContain(`<!-- kind:${kind} -->`);
+			expect(raw).toContain(`<!-- /kind:${kind} -->`);
+		}
+	});
+});
+
 describe("phasePrompt", () => {
 	it("includes the phase header, task, references, state summary, tools, and exit instruction", () => {
 		const state = stateInPhase("analyze");
@@ -157,6 +246,12 @@ describe("phasePrompt", () => {
 		const text = phasePrompt(stateInPhase("analyze", { entry: "issue-triage" }));
 		expect(text).toContain("Reference: issue-triage.md");
 		expect(text).toContain("deliverable");
+	});
+
+	it("tells every analyze entry the human can end the run at the gate with the analysis", () => {
+		for (const entry of ["analyze", "issue-triage", "pr-review-comments"] as const) {
+			expect(phasePrompt(stateInPhase("analyze", { entry }))).toContain("end the run at the approval gate");
+		}
 	});
 
 	it("mentions run_delegation for the delegate phase", () => {
@@ -261,6 +356,35 @@ describe("reference files stay standalone-complete", () => {
 		const text = raw("analyze");
 		expect(text).toContain("## Output of this phase");
 		expect(text).toContain("## Stop gate");
+		expect(text).toContain("## Classify the request");
+		expect(text).toContain("## Bug");
+	});
+
+	it("analyze.md's enforced blocks use the new field names and are stripped for the harness", () => {
+		const text = raw("analyze");
+		expect(text).toContain("`findings`");
+		expect(text).toContain("`evidence`");
+		expect(text).not.toContain("root_cause");
+		expect(text).not.toContain("repro_status");
+		expect(readReference("analyze")).not.toContain("## Output of this phase");
+	});
+
+	it("artifacts.md documents the analysis report fields, inside a harness marker", () => {
+		const text = raw("artifacts");
+		for (const field of ["`kind`", "`findings`", "`proposed_change`", "`out_of_scope`", "`evidence`", "`open_questions`", "`options`", "`recommendation`"]) {
+			expect(text).toContain(field);
+		}
+		expect(text).not.toContain("repro_status");
+		expect(readReference("artifacts")).not.toContain("`recommendation`");
+	});
+
+	it("issue-triage.md and pr-review-comments.md map onto the new field names", () => {
+		for (const name of ["issue-triage", "pr-review-comments"]) {
+			const text = raw(name);
+			expect(text).toContain("`findings`");
+			expect(text).toContain("`evidence`");
+			expect(text).not.toMatch(/repro_status|`root_cause`/);
+		}
 	});
 
 	it("plan.md still has its Output-of-this-phase heading and merge-plan bullets", () => {
