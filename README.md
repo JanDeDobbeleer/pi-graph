@@ -354,6 +354,52 @@ config both add to that list rather than replacing it, and an entry that names `
 `bash`, `powershell`, or any workflow tool is ignored so it can never widen what a read-only phase
 can actually do.
 
+## Gate decisions and suggestions
+
+Every human decision at the analysis and plan approval gates is recorded. This covers approve,
+choose an option, edit, revise (with the feedback), done, and stop/abort, from the dialog or from
+a `/change` command. Each record holds the artifact exactly as the human saw it, the review round,
+and any suggestion shown. It is written in two places:
+
+- a `code-changes-gate-decision` entry in the session
+- one JSON line in `~/.pi/agent/code-changes/gate-decisions.jsonl`, across projects
+
+Every gate is decided by a human, so each record is a ground-truth label for "would the human take
+this artifact as submitted?". That is the data any automated gate decision has to be measured
+against before it can be trusted.
+
+```json
+{
+  "gateLog": "~/.pi/agent/code-changes/gate-decisions.jsonl",
+  "gateAdvisor": {
+    "provider": "jev",
+    "apiKeyEnv": "TYPESAFE_API_KEY",
+    "model": "jev-latest",
+    "endpoint": "https://api.typesafe.ai/v1/systemone",
+    "timeoutMs": 4000,
+    "gates": ["analysis", "plan"]
+  }
+}
+```
+
+`gateLog` takes a path (relative to the config file's base: the repo for the project file, home
+for the user file) or `false` to turn off the file (session entries are still written).
+
+`gateAdvisor` is off unless configured and its API key variable is set. When it is on, the gate
+asks [Jev](https://typesafe.ai/), TypeSafe's typed-decision model, which choice the human is likely
+to make. The suggestion moves to the top of the dialog, marked `◂ suggested by Jev (88%)`. Without
+a UI, it is added to the hint as the matching `/change` command. The human still decides.
+Guardrails:
+
+- Jev is never offered "Approve and allow push/PR"; push is a permission, not a judgment.
+- Jev is never offered approve or choose while the analysis has open questions.
+- Advice is cached per artifact, so re-opening a gate does not call Jev again.
+- An error or timeout means no suggestion; it never blocks the gate.
+- The request sends the task and the artifact text (the analysis or the plan) to TypeSafe.
+
+Each logged decision records the suggestion and whether it was followed. Jev's confidence is
+uncalibrated, so fit a threshold on this log before relying on it.
+
 ## Parallel delegation
 
 The harness, not the model, decides which tasks run in parallel.

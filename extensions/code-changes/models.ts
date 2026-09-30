@@ -34,6 +34,8 @@ interface CodeChangesConfig {
 	tiers?: TierConfig;
 	readOnlyTools?: unknown;
 	maxParallel?: unknown;
+	gateLog?: unknown;
+	gateAdvisor?: unknown;
 }
 
 function readConfigFile(file: string): CodeChangesConfig | undefined {
@@ -105,6 +107,33 @@ export function loadMaxParallel(cwd: string, home: string = os.homedir()): numbe
 	const userConfig = readConfigFile(userConfigPath(home));
 	const projectConfig = readConfigFile(projectConfigPath(cwd));
 	return validMaxParallel(projectConfig?.maxParallel) ?? validMaxParallel(userConfig?.maxParallel) ?? DEFAULT_MAX_PARALLEL;
+}
+
+/** Default gate-decision log: one JSON line per human decision at the analysis/plan gates, across projects. */
+export function defaultGateLogPath(home: string = os.homedir()): string {
+	return path.join(home, ".pi", "agent", "code-changes", "gate-decisions.jsonl");
+}
+
+/**
+ * Where gate decisions are appended: `gateLog` from the project file, else the user file, else
+ * the default path. `false` turns the file log off (decisions still land in the session). A
+ * relative path resolves against the file's own base (cwd for the project file, home for the user file).
+ */
+export function loadGateLogPath(cwd: string, home: string = os.homedir()): string | undefined {
+	const resolve = (value: unknown, base: string): string | false | undefined => {
+		if (value === false) return false;
+		if (typeof value === "string" && value.trim()) return path.resolve(base, value.trim());
+		return undefined;
+	};
+	const project = resolve(readConfigFile(projectConfigPath(cwd))?.gateLog, cwd);
+	const user = resolve(readConfigFile(userConfigPath(home))?.gateLog, home);
+	const chosen = project ?? user ?? defaultGateLogPath(home);
+	return chosen === false ? undefined : chosen;
+}
+
+/** Raw `gateAdvisor` block (project file wins over the user file); gateadvisor.ts validates it. */
+export function loadGateAdvisorRaw(cwd: string, home: string = os.homedir()): unknown {
+	return readConfigFile(projectConfigPath(cwd))?.gateAdvisor ?? readConfigFile(userConfigPath(home))?.gateAdvisor;
 }
 
 export function parseModelRef(ref: string): { provider: string; id: string } | undefined {
