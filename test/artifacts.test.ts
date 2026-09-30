@@ -351,7 +351,37 @@ describe("applyAnalysis by kind", () => {
 
 	it("rejects a recommendation that is not an option id", () => {
 		expect(() => applyAnalysis(baseState(), featureReport({ recommendation: "Z" }) as AnalysisParams)).toThrow(/recommendation/);
-		expect(() => applyAnalysis(baseState(), analysis({ recommendation: "A" }))).toThrow(/recommendation/);
+	});
+
+	it("treats an empty recommendation as absent", () => {
+		for (const rec of ["", "   "]) {
+			const s = applyAnalysis(baseState(), analysis({ recommendation: rec }));
+			expect(s.analysis!.recommendation).toBeUndefined();
+			expect(s.phase).toBe("awaiting_approval");
+		}
+		const withOptions = applyAnalysis(baseState(), featureReport({ recommendation: "" }) as AnalysisParams);
+		expect(withOptions.analysis!.recommendation).toBeUndefined();
+	});
+
+	it("ignores a recommendation when no options were given", () => {
+		const s = applyAnalysis(baseState(), analysis({ recommendation: "none" }));
+		expect(s.analysis!.recommendation).toBeUndefined();
+		expect("recommendation" in s.analysis!).toBe(false);
+	});
+
+	it("stops a preApproved run at the gate when the recommended option needs no code change", () => {
+		const params = featureReport({
+			options: [
+				{ id: "A", title: "Use existing config", summary: "Set the flag.", tradeoffs: "None.", no_change: true },
+				{ id: "B", title: "File cache", summary: "Persist entries.", tradeoffs: "x" },
+			],
+			recommendation: "A",
+		}) as AnalysisParams;
+		const s = applyAnalysis(baseState({ preApproved: true }), params);
+		expect(s.phase).toBe("awaiting_approval");
+		expect(s.analysis!.chosen_option).toBeUndefined();
+		const other = applyAnalysis(baseState({ preApproved: true }), { ...params, recommendation: "B" });
+		expect(other.phase).toBe("plan");
 	});
 
 	it("rejects duplicate or empty option ids", () => {
@@ -432,6 +462,40 @@ describe("analysis gate helpers", () => {
 		expect(choices.slice(0, 2)).toEqual(["Go with A — Redis-backed cache (recommended)", "Go with B — File cache"]);
 		expect(choices).not.toContain("Approve");
 		expect(analysisGateChoices(selectOption(featureReport(), "B"))).toContain("Approve");
+	});
+
+	it("labels no-change options distinctly and still maps them back", () => {
+		const a = featureReport({
+			options: [
+				{ id: "cfg", title: "Use existing config", summary: "s", tradeoffs: "t", no_change: true },
+				{ id: "B", title: "File cache", summary: "s", tradeoffs: "t" },
+			],
+			recommendation: "cfg",
+		});
+		const choices = analysisGateChoices(a);
+		expect(choices[0]).toBe("Go with cfg — Use existing config (recommended) (no code change, ends the run)");
+		expect(choices[1]).toBe("Go with B — File cache");
+		expect(optionIdFromChoice(a, choices[0])).toBe("cfg");
+	});
+
+	it("round-trips the no_change mark through Markdown", () => {
+		const a = selectOption(
+			featureReport({
+				options: [
+					{ id: "cfg", title: "Use existing config", summary: "Set the flag.", tradeoffs: "None.", no_change: true },
+					{ id: "B", title: "File cache", summary: "Persist.", tradeoffs: "x" },
+				],
+				recommendation: "cfg",
+			}),
+			"cfg",
+		);
+		const md = formatAnalysis(a);
+		expect(md).toContain("### cfg — Use existing config (recommended) (chosen) (no code change)");
+		const parsed = parseAnalysisMarkdown(md);
+		expect(parsed.options![0]).toMatchObject({ id: "cfg", title: "Use existing config", no_change: true });
+		expect(parsed.options![1].no_change).toBeUndefined();
+		expect(parsed.recommendation).toBe("cfg");
+		expect(parsed.chosen_option).toBe("cfg");
 	});
 
 	it("maps a Go with entry back to its option id", () => {

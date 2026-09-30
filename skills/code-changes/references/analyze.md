@@ -133,7 +133,9 @@ A short analysis report to the user containing:
    (question), what was found (investigation), or what needs doing (chore) — with file references.
 2. The proposed change and its scope. It may be empty for a question or an investigation, or when
    the recommendation is to change nothing.
-3. Options with trade-offs and a recommendation, when there is a real design choice.
+3. Options with trade-offs and a recommendation, when there is a real design choice. Any kind may
+   offer them. An option that needs no repository change (existing config or docs already answer
+   it) sets `no_change: true`; choosing it ends the run with the analysis as the deliverable.
 4. What is intentionally out of scope.
 5. Evidence: the reproduction, prior art, or sources the findings rest on.
 6. Open questions, if any remain.

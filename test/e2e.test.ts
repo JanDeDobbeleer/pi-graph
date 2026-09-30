@@ -569,6 +569,54 @@ describe("code-changes e2e (real pi runtime, scripted fake model)", () => {
 	);
 
 	it(
+		"ends the run at Done when /change choose picks an option that needs no code change",
+		async () => {
+			const repo = await makeTempRepo();
+			cleanupDirs.push(repo);
+			const { extension: fakeProvider, model, queue } = makeFakeProvider();
+			const session = await makeSession(repo, [fakeProvider], model);
+
+			try {
+				queue.push({
+					tool: "submit_analysis",
+					args: {
+						kind: "question",
+						findings: "The greeting can be changed through existing configuration.",
+						proposed_change: "",
+						out_of_scope: "",
+						evidence: "read config",
+						open_questions: [],
+						options: [
+							{ id: "existing-config", title: "Use existing configuration", summary: "Edit the config.", tradeoffs: "None.", no_change: true },
+							{ id: "new-flag", title: "Add a flag", summary: "Add code.", tradeoffs: "More code." },
+						],
+						recommendation: "",
+					},
+				});
+
+				await session.prompt("/change how do I change the greeting?");
+				await session.waitForIdle();
+
+				await session.prompt("/change choose existing-config");
+				await session.waitForIdle();
+
+				expect(session.messages.some((m) => (m as any).customType === "code-changes-phase-prompt" && (m as any).details?.phase === "plan")).toBe(false);
+				const states = session.sessionManager
+					.getBranch()
+					.filter((e: any) => e.type === "custom" && e.customType === "code-changes-state");
+				const last = (states[states.length - 1] as any).data;
+				expect(last.phase).toBe("done");
+				expect(last.analysis.chosen_option).toBe("existing-config");
+				expect(last.delivery.commits).toEqual([]);
+				expect(last.delivery.no_commit_reason).toContain("existing-config");
+			} finally {
+				session.dispose();
+			}
+		},
+		TIMEOUT,
+	);
+
+	it(
 		"rejects a plan whose verification command uses a program the gate shell does not have, then accepts a valid one",
 		async () => {
 			const repo = await makeTempRepo();

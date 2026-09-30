@@ -22,6 +22,12 @@ const AnalysisOptionSchema = Type.Object({
 	title: Type.String({ description: "One-line name of the approach." }),
 	summary: Type.String({ description: "What this approach does and which files it touches." }),
 	tradeoffs: Type.String({ description: "What it costs and what it buys compared with the other options." }),
+	no_change: Type.Optional(
+		Type.Boolean({
+			description:
+				"True when this option needs no repository change (e.g. existing config or docs answer it). Choosing it ends the run with the analysis as the deliverable.",
+		}),
+	),
 });
 
 export const AnalysisSchema = Type.Object({
@@ -57,7 +63,7 @@ export const AnalysisSchema = Type.Object({
 			description: "Alternative approaches with trade-offs, when there is a real design choice. The human picks one at the gate.",
 		}),
 	),
-	recommendation: Type.Optional(Type.String({ description: "The id of the option you recommend. Must match one of the options." })),
+	recommendation: Type.Optional(Type.String({ description: "The id of the option you recommend. Omit when there are no options." })),
 });
 export type AnalysisParams = Static<typeof AnalysisSchema>;
 
@@ -177,7 +183,7 @@ const PROPOSED_CHANGE_HEADING = "Proposed change";
 const OUT_OF_SCOPE_HEADING = "Out of scope";
 const OPTIONS_HEADING = "Options";
 const NO_CHANGE_TEXT = "_No change proposed._";
-const OPTION_MARKS = /\s*\((recommended|chosen)\)\s*$/i;
+const OPTION_MARKS = /\s*\((recommended|chosen|no code change)\)\s*$/i;
 
 /** Kinds where a change is expected: `proposed_change` (or options to pick from) is required. */
 const CHANGE_KINDS: readonly AnalysisKind[] = ["bug", "feature", "refactor", "chore"];
@@ -217,7 +223,7 @@ export function formatAnalysis(a: AnalysisReport, opts?: { edited?: boolean }): 
 		lines.push("");
 		lines.push(`## ${OPTIONS_HEADING}`);
 		for (const o of a.options) {
-			const marks = (a.recommendation === o.id ? " (recommended)" : "") + (a.chosen_option === o.id ? " (chosen)" : "");
+			const marks = (a.recommendation === o.id ? " (recommended)" : "") + (a.chosen_option === o.id ? " (chosen)" : "") + (o.no_change ? " (no code change)" : "");
 			lines.push(`### ${o.id} — ${o.title}${marks}`);
 			lines.push(o.summary);
 			lines.push(`Trade-offs: ${o.tradeoffs}`);
@@ -234,14 +240,14 @@ function parseOptions(body: string[]): { options: AnalysisOption[]; recommendati
 	const options: AnalysisOption[] = [];
 	let recommendation: string | undefined;
 	let chosen: string | undefined;
-	let current: { id: string; title: string; lines: string[] } | undefined;
+	let current: { id: string; title: string; noChange: boolean; lines: string[] } | undefined;
 	const flush = () => {
 		if (!current) return;
 		const text = current.lines.join("\n");
 		const split = text.match(/^([\s\S]*?)(?:^|\n)[ \t]*trade-?offs?:[ \t]*([\s\S]*)$/i);
 		const summary = (split ? split[1] : text).trim();
 		const tradeoffs = (split ? split[2] : "").trim();
-		options.push({ id: current.id, title: current.title, summary, tradeoffs });
+		options.push({ id: current.id, title: current.title, summary, tradeoffs, ...(current.noChange ? { no_change: true } : {}) });
 		current = undefined;
 	};
 	for (const line of body) {
@@ -259,7 +265,7 @@ function parseOptions(body: string[]): { options: AnalysisOption[]; recommendati
 			const title = (m ? (m[2] ?? m[3] ?? "") : "").trim();
 			if (found.includes("recommended")) recommendation = id;
 			if (found.includes("chosen")) chosen = id;
-			current = { id, title, lines: [] };
+			current = { id, title, noChange: found.includes("no code change"), lines: [] };
 			continue;
 		}
 		if (current) current.lines.push(line);
@@ -401,7 +407,7 @@ const GO_WITH = "Go with ";
 export function analysisGateChoices(a: AnalysisReport): string[] {
 	const choices: string[] = [];
 	for (const o of a.options ?? []) {
-		choices.push(`${GO_WITH}${o.id} — ${o.title}${a.recommendation === o.id ? " (recommended)" : ""}`);
+		choices.push(`${GO_WITH}${o.id} — ${o.title}${a.recommendation === o.id ? " (recommended)" : ""}${o.no_change ? " (no code change, ends the run)" : ""}`);
 	}
 	if (hasProposedChange(a)) choices.push("Approve", "Approve and allow push/PR");
 	choices.push("Edit the analysis myself", "Send feedback to revise", "Done — no implementation", "Stop the run");
@@ -418,14 +424,19 @@ export function optionIdFromChoice(a: AnalysisReport, choice: string): string | 
 // 3. Analyze -> Plan / Awaiting approval
 // ---------------------------------------------------------------------------
 
-export function applyAnalysis(state: WorkflowState, a: AnalysisParams): WorkflowState {
+export function applyAnalysis(state: WorkflowState, params: AnalysisParams): WorkflowState {
 	if (state.phase !== "analyze") {
 		throw new ArtifactError(`Cannot submit an analysis report while in phase "${state.phase}"; expected "analyze".`);
 	}
-	if (!isAnalysisKind(a.kind)) {
-		throw new ArtifactError(`Analysis report has an invalid kind "${String(a.kind)}"; expected one of: ${ANALYSIS_KINDS.join(", ")}.`);
+	if (!isAnalysisKind(params.kind)) {
+		throw new ArtifactError(`Analysis report has an invalid kind "${String(params.kind)}"; expected one of: ${ANALYSIS_KINDS.join(", ")}.`);
 	}
-	const options = a.options ?? [];
+	const options = params.options ?? [];
+	// An empty recommendation means "none"; with no options there is nothing to recommend.
+	const rawRecommendation = typeof params.recommendation === "string" ? params.recommendation.trim() : undefined;
+	const recommendation = options.length > 0 && rawRecommendation ? rawRecommendation : undefined;
+	const a: AnalysisParams = { ...params, recommendation };
+	if (recommendation === undefined) delete a.recommendation;
 	const missing: string[] = [];
 	if (!a.findings.trim()) missing.push("findings");
 	if (!a.evidence.trim()) missing.push("evidence");
@@ -439,7 +450,7 @@ export function applyAnalysis(state: WorkflowState, a: AnalysisParams): Workflow
 	if (ids.some((id) => !id)) throw new ArtifactError("Analysis options must each have a non-empty id.");
 	const dupes = ids.filter((id, i) => ids.indexOf(id) !== i);
 	if (dupes.length > 0) throw new ArtifactError(`Analysis options have duplicate id(s): ${[...new Set(dupes)].join(", ")}.`);
-	if (a.recommendation !== undefined && !options.some((o) => o.id === a.recommendation)) {
+	if (a.recommendation !== undefined && !options.some((o) => o.id.trim() === a.recommendation)) {
 		throw new ArtifactError(
 			`Analysis recommendation "${a.recommendation}" does not match an option id${ids.length > 0 ? ` (${ids.join(", ")})` : " (no options were given)"}.`,
 		);
@@ -458,7 +469,9 @@ export function applyAnalysis(state: WorkflowState, a: AnalysisParams): Workflow
 	// being non-empty means this analysis follows at least one Verify attempt, so it always goes
 	// through approval again. A run only auto-advances when there is a change to plan from: a
 	// proposed change, or a recommendation to take. Questions and investigations stop at the gate.
-	const canAdvance = a.proposed_change.trim() !== "" || a.recommendation !== undefined;
+	// A recommended option that needs no repository change has nothing to plan: the human confirms it.
+	const recommended = options.find((o) => o.id.trim() === a.recommendation);
+	const canAdvance = !recommended?.no_change && (a.proposed_change.trim() !== "" || a.recommendation !== undefined);
 	const advance = state.preApproved && a.open_questions.length === 0 && state.failures.length === 0 && canAdvance;
 	if (advance && a.proposed_change.trim() === "" && a.recommendation !== undefined) {
 		analysis = selectOption(analysis, a.recommendation);
