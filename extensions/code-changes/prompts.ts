@@ -190,6 +190,9 @@ const EXTERNAL_CONTEXT_LINE =
 	"Read-only external context is available: `gh` (issue/pr/run/workflow/release view|list, pr diff|checks, repo view, search, label list, read-only api), " +
 	"`curl`/`Invoke-WebRequest` GETs, `git fetch`/`git ls-remote`, and any configured read-only tools (see README's `readOnlyTools`).";
 
+const READ_ONLY_SHELL_LINE =
+	"In this phase bash/powershell are limited to an allowlist of inspection commands; do not run interpreters or scripts (node -e, python, npm run, loops) — read files with read/grep/find instead. Execution happens in Delegate/Verify.";
+
 const PLAN_PARALLELISM_LINE =
 	"Split work by folder: give every sub-agent task `paths` (the folders/files/globs it may change). Independent tasks with non-overlapping paths run in parallel in separate worktrees automatically; overlapping independent tasks are rejected — add a dependency or merge them. Set requires_main_tree only when the task needs uncommitted local changes.";
 
@@ -204,6 +207,7 @@ function phaseExtra(state: WorkflowState): string | undefined {
 			const lines: string[] = [
 				"Edit and write are blocked in this phase. When the analysis report is submitted, a human must approve it (or revise it) before Plan begins.",
 				EXTERNAL_CONTEXT_LINE,
+				READ_ONLY_SHELL_LINE,
 			];
 			lines.push(
 				"Classify the request first — bug, feature, refactor, question, investigation, or chore — set `kind` accordingly, and follow that kind's section of the reference. " +
@@ -221,6 +225,7 @@ function phaseExtra(state: WorkflowState): string | undefined {
 		case "plan":
 			return [
 				EXTERNAL_CONTEXT_LINE,
+				READ_ONLY_SHELL_LINE,
 				PLAN_PARALLELISM_LINE,
 				`Verification commands run in ${gateShellPhrase()}; write them for that shell. The harness checks that the programs they invoke exist there when you submit the plan and rejects the plan otherwise.`,
 			].join("\n");

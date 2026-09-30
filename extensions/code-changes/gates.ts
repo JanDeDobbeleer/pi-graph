@@ -171,6 +171,7 @@ const GIT_SIMPLE_SUBCOMMANDS = new Set([
 	"cat-file",
 	"fetch",
 	"ls-remote",
+	"patch-id",
 ]);
 const GO_SUBCOMMANDS = new Set(["list", "env", "version", "doc"]);
 const NPM_SUBCOMMANDS = new Set(["ls", "view"]);
@@ -311,7 +312,35 @@ function isSafeInvokeWeb(args: string[]): boolean {
 	return true;
 }
 
-function isSafeGit(args: string[]): boolean {
+/** `git tag` in list-only mode: no args, or list/filter flags; a pattern positional only with `-l`/`--list`. */
+function isSafeGitTag(args: string[]): boolean {
+	const hasList = args.some((a) => a === "-l" || a === "--list");
+	for (let i = 0; i < args.length; i++) {
+		const a = args[i];
+		if (a === "-l" || a === "--list" || a === "--column" || a === "--no-column" || a === "-n" || /^-n\d+$/.test(a)) continue;
+		if (a.startsWith("--sort=") || a.startsWith("--format=")) continue;
+		if (a === "--contains" || a === "--no-contains" || a === "--points-at") {
+			if (args[i + 1] === undefined || args[i + 1].startsWith("-")) return false;
+			i++;
+			continue;
+		}
+		if (a === "--merged" || a === "--no-merged") {
+			if (args[i + 1] !== undefined && !args[i + 1].startsWith("-")) i++;
+			continue;
+		}
+		if (a.startsWith("-")) return false;
+		if (!hasList) return false;
+	}
+	return true;
+}
+
+function isSafeGit(rawArgs: string[]): boolean {
+	// `git -C <dir> ...` (possibly repeated) only changes the directory; validate the rest.
+	let args = rawArgs;
+	while (args[0] === "-C") {
+		if (args[1] === undefined) return false;
+		args = args.slice(2);
+	}
 	const sub = args[0];
 	if (sub === undefined) return false;
 	// `--output=<file>` (diff/log/show) writes a file; `git grep -O`/`--open-files-in-pager` runs a program.
@@ -319,9 +348,22 @@ function isSafeGit(args: string[]): boolean {
 	if (sub === "grep" && args.some((a) => a.startsWith("-O"))) return false;
 	if (GIT_SIMPLE_SUBCOMMANDS.has(sub)) return true;
 	if (sub === "branch") return !args.slice(1).some((a) => a === "-d" || a === "-D" || a === "-m" || a === "-M");
+	if (sub === "tag") return isSafeGitTag(args.slice(1));
 	if (sub === "remote") return args[1] === "-v";
 	if (sub === "config") return args[1] === "--get" || args[1] === "--list";
 	return false;
+}
+
+/** Short, concrete hint appended to the read-only block reason; derived from the real allowlist sets. */
+export function readOnlyHint(): string {
+	const files = [...SAFE_COMMANDS].filter((c) => /^[a-z]+$/.test(c) && c !== "type" && c !== "dir").slice(0, 14);
+	const gitSubs = [...GIT_SIMPLE_SUBCOMMANDS].slice(0, 6).join("/");
+	return (
+		`Allowed: file inspection (${[...files, "sed -n", "find", "rg"].join("/")}/...), git read commands (${gitSubs}/tag -l, git -C <dir> ...), ` +
+		"gh view/list, curl/Invoke-WebRequest GETs, and pipes between them. " +
+		"Blocked here: interpreters and scripts (node -e, python, npm run, shell loops, heredocs), writes and redirects. " +
+		"Use the read/grep/find tools for files; running code waits for Delegate/Verify."
+	);
 }
 
 function isSafeGo(args: string[]): boolean {
@@ -856,6 +898,9 @@ function isSafeSegment(segment: string, psEscapes: boolean): boolean {
 			return isSafeTree(args);
 		case "rg":
 			return isSafeRg(args);
+		case "tr":
+			// Pure stdin->stdout filter; redirects/substitutions are already rejected by the scan.
+			return true;
 		case "command":
 			return args[0] === "-v" || args[0] === "-V";
 		case "where-object":
@@ -918,7 +963,7 @@ export function isReadOnlyCommand(command: string): boolean {
 // ---------------------------------------------------------------------------
 
 const OUTWARD_PATTERNS: RegExp[] = [
-	/^git\s+push\b/i,
+	/^git\s+(?:-C\s+\S+\s+)*push\b/i,
 	/^gh\s+pr\s+create\b/i,
 	/^gh\s+pr\s+comment\b/i,
 	/^gh\s+pr\s+review\b/i,
@@ -970,7 +1015,7 @@ export function findOutwardSegment(command: string): string | undefined {
 }
 
 function isForcePushWithoutLease(segment: string): boolean {
-	if (!/^git\s+push\b/i.test(segment)) return false;
+	if (!/^git\s+(?:-C\s+\S+\s+)*push\b/i.test(segment)) return false;
 	const tokens = segment.trim().split(/\s+/);
 	const hasLease = tokens.some((t) => t === "--force-with-lease" || t.startsWith("--force-with-lease="));
 	const hasForce = tokens.some((t) => t === "--force" || t === "-f");
@@ -984,8 +1029,8 @@ export function findForcePushWithoutLease(command: string): string | undefined {
 }
 
 const BROAD_STAGING_PATTERNS: RegExp[] = [
-	/^git\s+add\s+(-A\b|--all\b|\.(\s|$)|:\/(\s|$))/i,
-	/^git\s+commit\s+(-a\b|-am\b|--all\b)/i,
+	/^git\s+(?:-C\s+\S+\s+)*add\s+(-A\b|--all\b|\.(\s|$)|:\/(\s|$))/i,
+	/^git\s+(?:-C\s+\S+\s+)*commit\s+(-a\b|-am\b|--all\b)/i,
 ];
 
 function isBroadStagingSegment(segment: string): boolean {
@@ -1070,7 +1115,7 @@ export function decideToolCall(
 			const label = PHASE_LABEL[phase];
 			return {
 				block: true,
-				reason: `${label} is read-only: only inspection commands are allowed until ${nextStepReason(phase, state)}.`,
+				reason: `${label} is read-only: only inspection commands are allowed until ${nextStepReason(phase, state)}. ${readOnlyHint()}`,
 			};
 		}
 

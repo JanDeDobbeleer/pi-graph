@@ -254,6 +254,16 @@ describe("phasePrompt", () => {
 		}
 	});
 
+	it("tells analyze and plan that the shell is allowlisted and execution waits for Delegate/Verify", () => {
+		for (const phase of ["analyze", "plan"] as const) {
+			const text = phasePrompt(stateInPhase(phase));
+			expect(text).toContain("limited to an allowlist of inspection commands");
+			expect(text).toContain("node -e, python, npm run, loops");
+			expect(text).toContain("Execution happens in Delegate/Verify");
+		}
+		expect(phasePrompt(stateInPhase("verify"))).not.toContain("limited to an allowlist of inspection commands");
+	});
+
 	it("mentions run_delegation for the delegate phase", () => {
 		const text = phasePrompt(stateInPhase("delegate"));
 		expect(text).toContain("Call run_delegation now");

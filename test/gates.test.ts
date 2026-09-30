@@ -68,6 +68,60 @@ describe("isReadOnlyCommand", () => {
 	});
 });
 
+describe("isReadOnlyCommand: git -C, git tag -l, patch-id, tr", () => {
+	it.each([
+		"git -C /x log --oneline",
+		"git -C /x -C sub status",
+		"git -C /x tag -l",
+		"git tag",
+		"git tag -l 'v1*'",
+		"git tag --list 'v*' --sort=-creatordate",
+		"git tag --contains abc123",
+		"git tag --no-contains abc123",
+		"git tag --merged",
+		"git tag --merged main",
+		"git tag --no-merged main",
+		"git tag --points-at HEAD",
+		"git tag -n5",
+		"git tag -n",
+		"git tag --format='%(refname)'",
+		"git tag --column",
+		"git tag --no-column",
+		"git patch-id",
+		"git show HEAD | git patch-id",
+		"tr a-z A-Z",
+		"cat f | tr ',' '\n'",
+		"echo a,b | tr -d '\r'",
+	])("accepts %s", (command) => {
+		expect(isReadOnlyCommand(command)).toBe(true);
+	});
+
+	it.each([
+		"git tag v1",
+		"git tag -d v1",
+		"git tag -a v1 -m x",
+		"git tag -s v1",
+		"git tag -f v1",
+		"git tag -m x v1",
+		"git tag -l -d v1",
+		"git tag --contains",
+		"git -C /x push",
+		"git -C /x commit -m y",
+		"git -C /x tag v1",
+		"git -C",
+		"git -C /x",
+		"tr a b > out",
+		"tr a b < in > out",
+		"tr a $(rm x)",
+	])("rejects %s", (command) => {
+		expect(isReadOnlyCommand(command)).toBe(false);
+	});
+
+	it("blocks git -C push as an outward action", () => {
+		expect(findOutwardSegment("git -C /x push origin main")).toBeDefined();
+	});
+});
+
 describe("isReadOnlyCommand: real-session and quote-aware cases", () => {
 	it.each([
 		'grep -n "clientsMap\\|getSocketClient\\|customListeners" node_modules/vite/dist/node/chunks/dep-*.js | head -20',
@@ -174,6 +228,16 @@ describe("decideToolCall", () => {
 	it("blocks edit in analyze", () => {
 		const decision = decideToolCall(stateInPhase("analyze"), "edit", {});
 		expect(decision?.block).toBe(true);
+	});
+
+	it("read-only block reason keeps the original sentence and adds a concrete hint", () => {
+		const decision = decideToolCall(stateInPhase("analyze"), "bash", { command: "node -e 1" });
+		expect(decision?.block).toBe(true);
+		expect(decision?.reason).toContain("Analyze is read-only: only inspection commands are allowed until");
+		expect(decision?.reason).toContain("Allowed: file inspection (cat/head/tail");
+		expect(decision?.reason).toContain("git -C <dir>");
+		expect(decision?.reason).toContain("Blocked here: interpreters and scripts");
+		expect(decision?.reason).toContain("Delegate/Verify");
 	});
 
 	it("allows edit in supervise", () => {
@@ -306,7 +370,7 @@ describe("decideToolCall", () => {
 	});
 
 	describe("findForcePushWithoutLease", () => {
-		it.each(["git push --force", "git push -f origin main", "git push origin main --force"])("flags %s", (command) => {
+		it.each(["git push --force", "git push -f origin main", "git push origin main --force", "git -C /x push --force"])("flags %s", (command) => {
 			expect(findForcePushWithoutLease(command)).toBeDefined();
 		});
 
@@ -316,7 +380,7 @@ describe("decideToolCall", () => {
 	});
 
 	describe("findBroadStagingSegment", () => {
-		it.each(["git add -A", "git add --all", "git add .", "git add :/", "git commit -a -m x", "git commit -am x", "git commit --all -m x"])(
+		it.each(["git add -A", "git add --all", "git add .", "git add :/", "git commit -a -m x", "git commit -am x", "git commit --all -m x", "git -C /x add -A", "git -C /x commit -am x"])(
 			"flags %s",
 			(command) => {
 				expect(findBroadStagingSegment(command)).toBeDefined();
