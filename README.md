@@ -400,6 +400,48 @@ Guardrails:
 Each logged decision records the suggestion and whether it was followed. Jev's confidence is
 uncalibrated, so fit a threshold on this log before relying on it.
 
+### Setting up the TypeSafe (Jev) advisor
+
+1. **Get access.** Jev is in early access. Join the waitlist at [typesafe.ai](https://typesafe.ai/)
+   and create an API key once you are in.
+2. **Provide the key through the environment.** Never put it in `code-changes.json`, which may be
+   committed. Export it in the shell that starts pi:
+
+   ```sh
+   export TYPESAFE_API_KEY=...        # bash/zsh
+   $env:TYPESAFE_API_KEY = "..."      # PowerShell
+   ```
+
+   To use another variable name, set `gateAdvisor.apiKeyEnv` to it.
+3. **Turn it on.** Add `"gateAdvisor": { "provider": "jev" }` to `~/.pi/agent/code-changes.json`
+   (all your repos) or `.pi/code-changes.json` (one repo; the project block replaces the user
+   block). The other fields are optional; the defaults are shown in the example above. To use it
+   at one gate only, set `"gates": ["plan"]`. To turn it off without deleting the block, set
+   `"enabled": false`.
+4. **Check it works.** Start a run with `/change <task>`. At the analysis gate, one entry should
+   be at the top of the dialog, marked `◂ suggested by Jev (NN%)`. The decision log line for that
+   gate has an `advice` field.
+
+When no suggestion appears, a one-time notice says why:
+
+| Notice | Cause |
+|---|---|
+| `gateAdvisor is configured but TYPESAFE_API_KEY is not set` | The key variable is missing in the environment pi was started from. |
+| `gateAdvisor.provider must be "jev"` | Typo in the config block. |
+| `no gate suggestion (HTTP 401)` / `(HTTP 403)` | The key is wrong, or its early access is not active. |
+| `no gate suggestion (HTTP 429)` | Rate limited; early-access limits can change without notice. |
+| `no gate suggestion (The operation was aborted due to timeout)` | Jev did not answer within `timeoutMs`, or a proxy is blocking the call (see below). |
+| `no gate suggestion (response did not name an offered choice)` | The API answered in an unexpected shape. The request format follows TypeSafe's published examples; report the response if you see this. |
+
+**Behind a proxy:** Node's built-in `fetch` ignores `HTTPS_PROXY` unless you also set
+`NODE_USE_ENV_PROXY=1` (supported in recent Node releases). Otherwise the call times out and you get no suggestion.
+
+**Limits to keep in mind:**
+- There is no SLA.
+- Inputs are capped at 64k tokens. The advisor trims the artifact to about 60,000 characters, well
+  below that.
+- Each call bills the input tokens only (about $0.042 per million), so a gate costs a fraction of a cent.
+
 ## Parallel delegation
 
 The harness, not the model, decides which tasks run in parallel.
