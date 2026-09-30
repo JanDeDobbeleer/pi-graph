@@ -84,7 +84,8 @@ export function offeredChoices(gate: GateKind, state: Pick<WorkflowState, "analy
 		if (c.decision === "choose_option") {
 			optionIndex++;
 			const option = state.analysis?.options?.find((o) => o.id === c.optionId);
-			offered.push({ ...c, key: `option_${optionIndex}`, description: `Pick option "${c.optionId}" (${option?.title ?? ""}) and plan it: ${option?.summary ?? ""}`.trim() });
+			const outcome = option?.no_change ? "end the run without any code change" : "plan it";
+			offered.push({ ...c, key: `option_${optionIndex}`, description: `Pick option "${c.optionId}" (${option?.title ?? ""}) and ${outcome}: ${option?.summary ?? ""}`.trim() });
 			continue;
 		}
 		offered.push({ ...c, key: c.decision, description: describe(gate, c.decision) });

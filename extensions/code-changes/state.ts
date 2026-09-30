@@ -55,6 +55,8 @@ export interface AnalysisOption {
 	title: string;
 	summary: string;
 	tradeoffs: string;
+	/** True when this option needs no repository change; choosing it ends the run with the analysis as the deliverable. */
+	no_change?: boolean;
 }
 
 export interface AnalysisReport {

@@ -86,8 +86,9 @@ and reports accordingly:
 | `chore` | "What needs doing" | "Evidence" | yes |
 
 The analysis also carries `proposed_change`, `out_of_scope`, `open_questions`, and, when there is a
-real design choice, `options` (each with `id`, `title`, `summary`, `tradeoffs`) plus a
-`recommendation` (an option id). `proposed_change` may be empty for a question or investigation, or
+real design choice, `options` (each with `id`, `title`, `summary`, `tradeoffs`, and `no_change: true` when the option
+needs no repository change) plus a `recommendation` (an option id; an empty one, or one given
+without options, is ignored). `proposed_change` may be empty for a question or investigation, or
 when the recommendation is to change nothing; for the other kinds it is required unless options
 are given. The rendered analysis starts `# Analysis — <kind>` with an editable `Kind:` line, and
 its findings and evidence sections use the kind's headings (the parser accepts any kind's heading,
@@ -96,14 +97,15 @@ plus the neutral "Findings"/"Evidence"). Sessions saved before this change (with
 
 At the Analyze approval gate ("Review the `<kind>` analysis above"), the human picks one of: **Go
 with `<id>` — `<title>`** (one entry per option, the recommended one marked; records the choice and
-continues to Plan, like `/change choose <id>`); **Approve** and **Approve and allow push/PR**
+continues to Plan, like `/change choose <id>`; a `no_change` option is labelled "no code change,
+ends the run" and choosing it ends the run at Done with the analysis as the deliverable); **Approve** and **Approve and allow push/PR**
 (same as approve, plus `/change allow-push`; only offered when a change is proposed or an option
 was chosen); **Edit the analysis myself** (opens an editor pre-filled with the analysis — the edits
 become the approved artifact, recorded as `analysisEditedByHuman`); **Send feedback to revise**
 (same as `/change revise`); **Done — no implementation** (any kind: end the run here with the
 analysis as the deliverable; same as `/change done`); or **Stop the run**. A `--approved` run
-skips the gate only when the analysis has a proposed change (or a recommendation to take), no open
-questions, and no earlier Verify failure; a question or investigation always stops at the gate.
+skips the gate only when the analysis has a proposed change (or a recommendation to take that is
+not a `no_change` option), no open questions, and no earlier Verify failure; a question or investigation always stops at the gate.
 
 Plan ends with its own gate, right after `submit_plan`, mirroring the analysis gate: **Approve —
 start delegation**; **Edit the plan myself** (opens an editor pre-filled with the plan as JSON,
@@ -128,7 +130,7 @@ read them. The analysis, final report, hook failures and CI failures always rend
 | Gate | Mechanism |
 |------|-----------|
 | Only the current phase's tools are callable | `tool_call` handler + `pi.setActiveTools(...)` per phase |
-| Analyze/Plan/awaiting_plan_approval/Delegate/CI are read-only (no edit/write, bash restricted) | `isReadOnlyCommand` allowlist in `gates.ts`, including directory-navigation commands (`cd`, `pushd`/`popd`, `Set-Location`/`sl`, `Push-Location`/`Pop-Location`) |
+| Analyze/Plan/awaiting_plan_approval/Delegate/CI are read-only (no edit/write, bash restricted) | `isReadOnlyCommand` allowlist in `gates.ts`, including directory-navigation commands (`cd`, `pushd`/`popd`, `Set-Location`/`sl`, `Push-Location`/`Pop-Location`), `git -C <dir>`, list-only `git tag`, and `tr`; a blocked command's reason lists what is allowed and says interpreters/scripts wait for Delegate/Verify |
 | Analyze and Plan can still fetch external context (issues, PRs, docs) | read-only `gh` (issue/pr/run/workflow/release `view`/`list`, `pr diff`/`checks`, `repo view`, `search`, `label list`, read-only `api`), `curl`/`Invoke-WebRequest` GETs, and `git fetch`/`git ls-remote` are allowed by `isReadOnlyCommand`; any registered read-only tools from other extensions (web fetch/search, MCP bridges) are also activated — see `readOnlyTools` below |
 | A phase cannot be left without its artifact | one `submit_*` tool per edge; validation throws until the artifact is complete |
 | The human approves (or revises) the analysis | `agent_settled` gate: `ctx.ui.select` when Analyze finishes, or `/change approve|revise` |

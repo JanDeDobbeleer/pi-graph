@@ -577,17 +577,14 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	const NO_UI_GATE_HINT = "code-changes: analysis ready. Run /change approve (or /change choose <option-id>), /change done, /change show or /change revise <feedback>.";
 
 	/** Ends the run at the analysis gate with the analysis itself as the deliverable. */
-	async function finishWithAnalysis(ctx: ExtensionContext): Promise<void> {
+	async function finishWithAnalysis(ctx: ExtensionContext, chosen?: AnalysisReport): Promise<void> {
 		if (!state || state.phase !== "awaiting_approval" || !state.analysis) return;
-		const report = `Analysis complete — no implementation performed.\n\n${formatAnalysis(state.analysis, { edited: state.analysisEditedByHuman })}`;
-		const withDelivery = {
-			...state,
-			delivery: {
-				commits: [],
-				no_commit_reason: `${state.analysis.kind} analysis: the analysis is the deliverable, no implementation was performed.`,
-				report,
-			},
-		};
+		const analysis = chosen ?? state.analysis;
+		const report = `Analysis complete — no implementation performed.\n\n${formatAnalysis(analysis, { edited: state.analysisEditedByHuman })}`;
+		const no_commit_reason = chosen
+			? `${chosen.kind} analysis: chose option ${chosen.chosen_option}, which needs no repository change; the analysis is the deliverable.`
+			: `${analysis.kind} analysis: the analysis is the deliverable, no implementation was performed.`;
+		const withDelivery = { ...state, analysis, delivery: { commits: [], no_commit_reason, report } };
 		setState(transition(withDelivery, "done"), ctx);
 		await enterPhase(ctx);
 	}
@@ -617,8 +614,12 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		const optionId = optionIdFromChoice(state.analysis!, choice);
 		if (optionId !== undefined) {
 			recordGateDecision(ctx, "choose_option", "dialog", { optionId });
-			const picked = { ...state, analysis: selectOption(state.analysis!, optionId) };
-			setState(transition(picked, "plan"), ctx);
+			const selected = selectOption(state.analysis!, optionId);
+			if (selected.options?.find((o) => o.id === optionId)?.no_change) {
+				await finishWithAnalysis(ctx, selected);
+				return;
+			}
+			setState(transition({ ...state, analysis: selected }, "plan"), ctx);
 			await enterPhase(ctx);
 			return;
 		}
@@ -959,10 +960,13 @@ export default function codeChanges(pi: ExtensionAPI): void {
 					return;
 				}
 				try {
-					const analysis = selectOption(state.analysis, restText);
+					const selected = selectOption(state.analysis, restText);
 					recordGateDecision(ctx, "choose_option", "command", { optionId: restText });
-					const picked = { ...state!, analysis };
-					setState(transition(picked, "plan"), ctx);
+					if (selected.options?.find((o) => o.id === selected.chosen_option)?.no_change) {
+						await finishWithAnalysis(ctx, selected);
+						return;
+					}
+					setState(transition({ ...state!, analysis: selected }, "plan"), ctx);
 				} catch (err) {
 					ctx.ui.notify(`code-changes: ${err instanceof Error ? err.message : String(err)}`, "warning");
 					return;
