@@ -142,6 +142,10 @@ export interface ReviewedDiff {
 export interface GateResult {
 	command: string;
 	exit_code: number;
+	/** Shell the command ran in, e.g. "bash (C:/Program Files/Git/bin/bash.exe)" or "cmd.exe". */
+	shell?: string;
+	/** False when the command could not run at all (program not found): a harness/environment problem, not a product failure. */
+	runnable?: boolean;
 	/** Truncated combined output. */
 	output: string;
 	duration_ms: number;
@@ -156,6 +160,19 @@ export interface FailureRecord {
 	destination: "supervise" | "analyze";
 	summary: string;
 	escalation_answer?: string;
+	/** True when every failing gate was not runnable; such failures do not count toward the retry cap. */
+	harness?: boolean;
+}
+
+/** A human-approved change to the plan's required gates. */
+export interface GateAmendment {
+	/** Gate being replaced or removed. */
+	old: string;
+	/** Replacement; undefined removes the gate. */
+	new?: string;
+	reason: string;
+	phase: Phase;
+	approved_at: string;
 }
 
 // Verify → Deliver
@@ -256,6 +273,12 @@ export interface WorkflowState {
 	pr?: PullRequestRef;
 	/** Set when CI failed; Verify cannot pass until it is classified as a failure and fixed. */
 	ciFailure?: CiFailure;
+	/** Human-approved changes to the required gates (applied on top of the plan's verification commands). */
+	gateAmendments?: GateAmendment[];
+	/** Phase the run was in when it stopped; /change resume can reopen it with the user's go. */
+	stoppedFrom?: Phase;
+	/** Summary of the previous run in this session, carried into a follow-up run's prompts. */
+	previousRun?: string;
 	/** Human-readable reason when phase is "stopped". */
 	stopReason?: string;
 	/** True once the next-phase prompt for the current phase has been sent. */
@@ -308,7 +331,8 @@ export const EDGES: Record<Phase, Phase[]> = {
 	deliver: ["done", "ci", "stopped"],
 	ci: ["done", "verify", "stopped"],
 	done: [],
-	stopped: [],
+	// Reopened only by the user (/change resume after a stop); the retry count is reset then.
+	stopped: ["analyze", "plan", "supervise", "verify", "deliver"],
 };
 
 export function transition(state: WorkflowState, to: Phase): WorkflowState {

@@ -66,7 +66,11 @@ pi -e ./extensions/code-changes/index.ts
 /change cleanup                  remove any leftover worktrees for the active run
 /change watch [pr]               watch a PR's checks (explicit; also restarts a stalled/timed-out watch)
 /change resume                   re-send the current phase's instructions (or re-open the active
-                                 gate) after an interruption, resetting the transient-retry counter
+                                 gate) after an interruption, resetting the transient-retry counter;
+                                 on a stopped run, reopen the phase it stopped in (with your
+                                 confirmation) and reset the Verify retry count
+/change amend-gate approve|reject  decide a pending required-gate amendment (asked for by the model
+                                 with `amend_gate` when there is no UI to confirm in)
 ```
 
 Analyze works for any request, not only bugs. The model first classifies it as one of six kinds
@@ -250,6 +254,50 @@ success while CI is still red.
   PR per session — after that the harness only notifies instead of prompting another turn.
 - Requires an authenticated `gh` (GitHub CLI); without it, `resolvePr`/`gh pr checks` simply find
   nothing to watch, and a run without a detected PR completes normally at **done**.
+
+## Gates: shell, plan-time check, unrunnable gates
+
+- **Same shell as the model's `bash` tool.** `run_gates` runs each command with `bash -c` inside the
+  repo, in the shell pi's own `bash` tool resolves (`getShellConfig` from pi: `shellPath` in pi's
+  `settings.json`, Git for Windows in `Program Files`, `/bin/bash`, ...). If pi has none, it falls
+  back to the resolver the Stop hooks use (`CLAUDE_CODE_GIT_BASH_PATH`, Git Bash derived from
+  `git`, any bash on PATH that isn't the System32/WindowsApps WSL stub), and last to the platform
+  shell (`cmd.exe` / `sh`). Previously gates ran through `cmd.exe` on Windows, so a plan that
+  worked in the model's bash (`grep ... || true`) failed in Verify. The `run_gates` table has a
+  `shell` column and every `GateResult` records it. The shell logic lives in `shell.ts`.
+- **Plan-time check.** On `submit_plan`, the first word of each segment of every verification
+  command (split on `&&`, `||`, `;`, `|`, quote-aware; builtins, keywords and `A=b` assignments
+  skipped) is looked up in the gate shell with `command -v` (or `where` for cmd.exe), in one
+  invocation with a 5 s timeout (`gatecheck.ts`). A missing program rejects the plan, naming the
+  command, the program and the shell, so the model can rewrite the gate while it is still cheap.
+  If the check itself can't run, the plan is accepted with a warning.
+- **Unrunnable gates.** A failed gate whose exit code is 127, or whose output says the program or
+  path doesn't exist (`is not recognized`, `command not found`, `cannot find the path`, ...), or
+  that failed to spawn, is marked `runnable: false`. `run_gates` reports it as `NOT RUNNABLE
+  (environment)` and points at `amend_gate`. If every failing required gate is unrunnable,
+  `submit_verification fail` records a `harness` failure: it routes to Supervise but does **not**
+  count toward the retry cap (the second-failure escalation and third-failure stop only count
+  real failures). A pass still needs every required gate runnable and green.
+- **`amend_gate`** (Supervise and Verify; params `gate`, optional `replacement`, `reason`; omit
+  `replacement` to remove the gate). Required gates are frozen at plan time, so this is the only
+  way to change one, and it always needs the user: `ctx.ui.confirm` when there is a UI, otherwise
+  the request is stored as pending and the user runs `/change amend-gate approve|reject`. The
+  replacement goes through the same plan-time program check. Approved amendments are recorded in
+  `state.gateAmendments`, applied by `requiredGateCommands`, and listed in the Deliver prompt so
+  the report says so. The model is told never to use it to weaken a meaningful check.
+
+## Stopped runs and follow-up runs
+
+- **Reopen a stopped run.** When a run stops (a third Verify failure, a failed escalation, `/change
+  abort`, "Stop the run" at a gate), the phase it stopped in is remembered (`stoppedFrom`).
+  `/change status` then says `Stopped — /change resume to reopen <phase>`. `/change resume`
+  confirms with the stop reason, reopens that phase, and restarts the Verify retry count (earlier
+  failures stay in the history but no longer count; the marker is persisted with a
+  `code-changes-resume` entry).
+- **Carry context into the next run.** `/change <task>` right after a run finished or stopped in the
+  same session attaches a compact summary of it (task, kind, findings, proposed change, delivery
+  report or stop reason, files changed) as `state.previousRun`; the new run's Analyze prompt shows
+  it under "Previous run in this session".
 
 ## Transient provider errors
 

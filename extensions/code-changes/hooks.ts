@@ -16,7 +16,10 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { git } from "./runner.ts";
+import { resolveBashSync } from "./shell.ts";
 import type { HookResult } from "./state.ts";
+
+export { resolveBash, type ResolveBashOptions } from "./shell.ts";
 
 const DEFAULT_TIMEOUT_MS = 600_000;
 const DEFAULT_MAX_OUTPUT = 12_000;
@@ -86,112 +89,6 @@ function commandExistsSync(name: string, platform: NodeJS.Platform): boolean {
 		}
 	}
 	return false;
-}
-
-// ---------------------------------------------------------------------------
-// Windows bash resolution
-// ---------------------------------------------------------------------------
-//
-// On Windows, the first `bash` found by a plain PATH scan is very often
-// C:\Windows\System32\bash.exe — the WSL launcher stub. Spawning a repo's Stop hook through it
-// runs the hook *inside WSL*, against the WSL filesystem, not the Windows checkout the harness
-// (and Claude Code) is actually operating on. Claude Code itself resolves a real Git Bash on
-// Windows, so we emulate that: prefer an explicit override, then derive Git Bash from `git`'s own
-// location on PATH, then fall back to any bash on PATH that isn't the WSL launcher.
-
-// Matched against a lowercased path with both slash styles normalized to "\": the WSL launcher
-// stub lives at "...\Windows\System32\bash.exe" (or SysWOW64); a per-user app-execution-alias
-// stub can live at "...\WindowsApps\bash.exe" (there is no literal "Windows\" segment before it).
-const SYSTEM32_SEGMENT = /[\\/]system32[\\/]|[\\/]syswow64[\\/]/i;
-const WINDOWSAPPS_SEGMENT = /[\\/]windowsapps([\\/]|$)/i;
-
-export interface ResolveBashOptions {
-	platform: NodeJS.Platform;
-	/** Environment variables, at minimum PATH/Path and (on win32) CLAUDE_CODE_GIT_BASH_PATH. */
-	env: Record<string, string | undefined>;
-	/** PATH, already split into directories, in PATH order. */
-	pathDirs: string[];
-	/** Pure existence check (a file, not necessarily executable-checked further). */
-	exists(filePath: string): boolean;
-}
-
-/**
- * Joins path segments using `platform`'s own separator, independent of the host OS running this
- * code (so the win32 logic is exercisable from a test running on any platform, and vice versa).
- */
-function joinAs(platform: NodeJS.Platform, dir: string, name: string): string {
-	const sep = platform === "win32" ? "\\" : "/";
-	const trimmed = dir.replace(/[\\/]+$/, "");
-	return trimmed.length > 0 ? `${trimmed}${sep}${name}` : name;
-}
-
-/** `...\Git\cmd`, `...\Git\bin`, or `...\Git\mingw64\bin` -> `...\Git\bin\bash.exe`. */
-function deriveGitBashPath(gitDir: string): string | undefined {
-	const normalized = gitDir.replace(/[\\/]+$/, "");
-	const lower = normalized.toLowerCase();
-	let root: string | undefined;
-	if (lower.endsWith("\\mingw64\\bin") || lower.endsWith("/mingw64/bin")) {
-		root = normalized.slice(0, -"\\mingw64\\bin".length);
-	} else if (lower.endsWith("\\cmd") || lower.endsWith("/cmd") || lower.endsWith("\\bin") || lower.endsWith("/bin")) {
-		root = normalized.slice(0, -4);
-	}
-	if (!root) return undefined;
-	return joinAs("win32", joinAs("win32", root, "bin"), "bash.exe");
-}
-
-/**
- * Pure bash-selection logic (no spawn, no real fs): resolves the bash to run repo Stop hooks
- * with. On win32, in order: `env.CLAUDE_CODE_GIT_BASH_PATH` if it exists; else Git Bash derived
- * from a `git.exe`/`git.cmd` found on PATH; else any `bash.exe` on PATH that is not under
- * `%SystemRoot%\System32` (or SysWOW64) or `WindowsApps` — the WSL launcher stub lives there.
- * Off win32, the first `bash` found on PATH.
- */
-export function resolveBash(opts: ResolveBashOptions): string | undefined {
-	const { platform, env, pathDirs, exists } = opts;
-
-	if (platform !== "win32") {
-		for (const dir of pathDirs) {
-			const candidate = joinAs(platform, dir, "bash");
-			if (exists(candidate)) return candidate;
-		}
-		return undefined;
-	}
-
-	const override = env.CLAUDE_CODE_GIT_BASH_PATH;
-	if (override && exists(override)) return override;
-
-	for (const dir of pathDirs) {
-		if (exists(joinAs(platform, dir, "git.exe")) || exists(joinAs(platform, dir, "git.cmd"))) {
-			const derived = deriveGitBashPath(dir);
-			if (derived && exists(derived)) return derived;
-		}
-	}
-
-	for (const dir of pathDirs) {
-		if (SYSTEM32_SEGMENT.test(`${dir}\\`) || WINDOWSAPPS_SEGMENT.test(`${dir}\\`)) continue;
-		const candidate = joinAs(platform, dir, "bash.exe");
-		if (exists(candidate)) return candidate;
-	}
-
-	return undefined;
-}
-
-/** `resolveBash` wired to the real process env, PATH, and filesystem. */
-function resolveBashSync(platform: NodeJS.Platform): string | undefined {
-	const pathEnv = process.env.PATH ?? process.env.Path ?? process.env.path ?? "";
-	const pathDirs = pathEnv.split(platform === "win32" ? ";" : ":").filter((d) => d.length > 0);
-	return resolveBash({
-		platform,
-		env: process.env as Record<string, string | undefined>,
-		pathDirs,
-		exists: (filePath) => {
-			try {
-				return fs.statSync(filePath).isFile();
-			} catch {
-				return false;
-			}
-		},
-	});
 }
 
 function expandClaudeProjectDir(command: string, repoRoot: string): string {

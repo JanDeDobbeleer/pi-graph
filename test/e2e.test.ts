@@ -555,4 +555,69 @@ describe("code-changes e2e (real pi runtime, scripted fake model)", () => {
 		},
 		TIMEOUT,
 	);
+
+	it(
+		"rejects a plan whose verification command uses a program the gate shell does not have, then accepts a valid one",
+		async () => {
+			const repo = await makeTempRepo();
+			cleanupDirs.push(repo);
+			const { extension: fakeProvider, model, queue } = makeFakeProvider();
+			const session = await makeSession(repo, [fakeProvider], model);
+
+			const planWith = (command: string) => ({
+				tool: "submit_plan",
+				args: {
+					tasks: [
+						{
+							id: "t1",
+							spec: "Change greeting.txt to say Hi instead of Hello.",
+							verification_commands: [command],
+							executor_tier: "coordinator-direct",
+							workspace: "main",
+							dependencies: [],
+						},
+					],
+				},
+			});
+
+			try {
+				queue.push({
+					tool: "submit_analysis",
+					args: {
+						kind: "bug",
+						findings: "greeting.txt says Hello instead of Hi",
+						proposed_change: "change the greeting text to Hi",
+						out_of_scope: "nothing else",
+						evidence: "reproduced: read greeting.txt",
+						open_questions: [],
+					},
+				});
+				queue.push(planWith("definitely-not-a-real-program-xyz --check"));
+				queue.push(planWith('node -e "process.exit(0)"'));
+
+				await session.prompt("/change --approved fix the greeting");
+				await session.waitForIdle();
+
+				const planResults = session.messages.filter((m) => m.role === "toolResult" && m.toolName === "submit_plan") as any[];
+				expect(planResults.length).toBeGreaterThanOrEqual(2);
+				const rejected = planResults[0];
+				expect(rejected.isError).toBe(true);
+				const rejectedText: string = rejected.content.map((c: any) => c.text).join(" ");
+				expect(rejectedText).toContain("definitely-not-a-real-program-xyz");
+				expect(rejectedText).toContain("rewrite them for it");
+				expect(rejectedText).toMatch(/Verification commands run in (bash|cmd\.exe|sh)/);
+				expect(planResults[1].isError).toBeFalsy();
+
+				const states = session.sessionManager
+					.getBranch()
+					.filter((e: any) => e.type === "custom" && e.customType === "code-changes-state");
+				const last = (states[states.length - 1] as any).data;
+				expect(last.plan.tasks[0].verification_commands).toEqual(['node -e "process.exit(0)"']);
+				expect(last.phase).not.toBe("plan");
+			} finally {
+				session.dispose();
+			}
+		},
+		TIMEOUT,
+	);
 });

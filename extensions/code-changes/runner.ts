@@ -7,6 +7,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { platformShell, resolveGateShell, type GateShell } from "./shell.ts";
 import type { GateResult } from "./state.ts";
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -45,14 +46,29 @@ export interface RunShellOptions {
 	signal?: AbortSignal;
 	timeoutMs?: number;
 	maxOutput?: number;
+	/** Shell to run in; defaults to the shell pi's bash tool uses (see shell.ts). */
+	shell?: GateShell;
+}
+
+/** Output that means "the command itself could not be found or started" rather than "it ran and failed". */
+const UNRUNNABLE_OUTPUT =
+	/is not recognized as an internal or external command|command not found|No such file or directory.*(?:bash|sh):|cannot find the path|The term '.+' is not recognized/i;
+
+/** True when a failed run says the environment cannot run the command at all (missing program, bad path). */
+export function isUnrunnable(exitCode: number, output: string): boolean {
+	if (exitCode === 0) return false;
+	return exitCode === 127 || UNRUNNABLE_OUTPUT.test(output);
 }
 
 /**
- * Runs `command` in a shell (cmd.exe on Windows, sh elsewhere) inside `cwd`.
+ * Runs `command` in the gate shell inside `cwd`: `bash -c` when a bash resolves (the same shell
+ * pi's bash tool uses), else the platform shell (cmd.exe on Windows, sh elsewhere).
  * Merges stdout+stderr in arrival order. Never throws: non-zero exit, timeout, abort and
- * spawn errors are all reported through the returned `GateResult`.
+ * spawn errors are all reported through the returned `GateResult`, which names the shell and
+ * says whether the command was runnable at all.
  */
 export async function runShell(command: string, cwd: string, opts?: RunShellOptions): Promise<GateResult> {
+	const shell = opts?.shell ?? (await resolveGateShell(cwd).catch(() => platformShell()));
 	const timeoutMs = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const maxOutput = opts?.maxOutput ?? DEFAULT_MAX_OUTPUT;
 	const start = Date.now();
@@ -62,19 +78,21 @@ export async function runShell(command: string, cwd: string, opts?: RunShellOpti
 		let settled = false;
 		let timedOut = false;
 		let aborted = false;
+		let spawnFailed = false;
 		let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 
 		let proc: ReturnType<typeof spawn>;
 		try {
-			proc = spawn(command, {
-				cwd,
-				shell: true,
-				stdio: ["ignore", "pipe", "pipe"],
-			});
+			proc =
+				shell.kind === "bash" && shell.file
+					? spawn(shell.file, [...(shell.args ?? ["-c"]), command], { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] })
+					: spawn(command, { cwd, shell: true, stdio: ["ignore", "pipe", "pipe"] });
 		} catch (err) {
 			resolve({
 				command,
 				exit_code: 127,
+				shell: shell.label,
+				runnable: false,
 				output: `Failed to spawn command: ${err instanceof Error ? err.message : String(err)}`,
 				duration_ms: Date.now() - start,
 			});
@@ -90,6 +108,8 @@ export async function runShell(command: string, cwd: string, opts?: RunShellOpti
 			resolve({
 				command,
 				exit_code: exitCode,
+				shell: shell.label,
+				runnable: !(spawnFailed || isUnrunnable(exitCode, combined)),
 				output: truncateOutput(combined, maxOutput),
 				duration_ms: Date.now() - start,
 			});
@@ -118,6 +138,7 @@ export async function runShell(command: string, cwd: string, opts?: RunShellOpti
 		});
 
 		proc.on("error", (err) => {
+			spawnFailed = true;
 			finish(127, `Spawn error: ${err instanceof Error ? err.message : String(err)}`);
 		});
 

@@ -68,6 +68,108 @@ describe("isReadOnlyCommand", () => {
 	});
 });
 
+describe("isReadOnlyCommand: real-session and quote-aware cases", () => {
+	it.each([
+		'grep -n "clientsMap\\|getSocketClient\\|customListeners" node_modules/vite/dist/node/chunks/dep-*.js | head -20',
+		'grep "a|b" f',
+		"grep 'a;rm x' f",
+		'grep "rm" f',
+		'grep "a>b" f',
+		"grep 'a$(b)' f",
+		"curl -sL https://unpkg.com/x/README.md | sed -n 20,140p",
+		"sed -n 1,20p README.md",
+		"sed -E 's/a+/b/g' f",
+		"sed -n '/foo/,/bar/p' f",
+		"sed -e 's/[0-9]/x/gI' f",
+		"curl -sL https://x/README.md -o /dev/stdout | sed -n 20,140p",
+		"curl -sL https://x -o - | head",
+		"curl -s --output - https://x",
+		"curl -so - https://x",
+		"gh auth status",
+		"gh --version",
+		"gh repo list",
+		"which git",
+		"where git",
+		"Get-Command git",
+		"gcm git",
+		"command -v git",
+		"type git",
+		'(Invoke-WebRequest -UseBasicParsing https://x/README.md).Content.Split("`n")[19..140] -join "`n"',
+		"(irm https://x/a.json).items[0].name",
+		"(Get-Content package.json | ConvertFrom-Json).version",
+		"irm https://x | Select-Object -First 5",
+		"Get-Content f | Select-String foo | Measure-Object",
+		"Get-ChildItem | Where-Object { $_.Name -like '*.ts' }",
+		"Get-Content f | ConvertFrom-Json | Format-List",
+		"which copilot gh 2>&1; ls ~/.copilot 2>&1 | head; gh auth status 2>&1 | head -5; git log --oneline -4; git status --short",
+	])("accepts %s", (command) => {
+		expect(isReadOnlyCommand(command)).toBe(true);
+	});
+
+	it.each([
+		"npm pack left-pad && tar xzf left-pad-1.0.0.tgz",
+		"rm x",
+		"mkdir out",
+		"cd /tmp && rm -rf x",
+		'node -e "console.log(1)"',
+		"python -c 'print(1)'",
+		"sed -i s/a/b/ f",
+		"sed -i.bak s/a/b/ f",
+		"sed -Ei s/a/b/ f",
+		"sed --in-place s/a/b/ f",
+		"sed 's/a/b/w out' f",
+		"sed -n 'w out' f",
+		"sed -n '1e rm x' f",
+		"sed -f script.sed f",
+		"curl -o file https://x",
+		"curl -sLo file https://x",
+		"curl --output=file https://x",
+		"curl -O https://x",
+		"curl -D h.txt https://x",
+		"(iwr x -OutFile f)",
+		"(iwr x -Out f)",
+		"$c = (irm x)",
+		"(irm x) | Out-File f",
+		"(irm x).Content | Set-Content f",
+		"(irm x) > f",
+		"(irm x); Remove-Item f",
+		"(irm x).Content.Delete()",
+		"(Remove-Item f)",
+		"Get-Content (Remove-Item f)",
+		"Get-Content f | ForEach-Object { Remove-Item $_ }",
+		"Get-ChildItem | Where-Object { Remove-Item $_ }",
+		"Get-Content f | Select-Object @{n='a';e={Remove-Item x}}",
+		"echo $(rm x)",
+		'echo "$(rm x)"',
+		'echo "`rm x`"',
+		"echo `rm x`",
+		'echo "x" > f',
+		"grep a f; rm x",
+		"grep a f && rm x",
+		"grep a f & rm x",
+		"ls a\\| rm x",
+		"echo \"a\\\"; rm x; echo \"",
+		"echo 'unterminated",
+		"sort -o out f",
+		"git diff --output=out",
+		"find . -exec rm {} ;",
+		"gh pr view 1 --web",
+		"gh auth login",
+		"gh repo delete x",
+		"cat <(rm x)",
+	])("rejects %s", (command) => {
+		expect(isReadOnlyCommand(command)).toBe(false);
+	});
+});
+
+describe("outward-action finders are quote- and subshell-aware", () => {
+	it("still flags a push after a separator or inside a subshell", () => {
+		expect(findOutwardSegment("git status && git push")).toBeDefined();
+		expect(findOutwardSegment("(cd x; git push)")).toBeDefined();
+		expect(findOutwardSegment("git status | git push")).toBeDefined();
+	});
+});
+
 describe("decideToolCall", () => {
 	it("blocks edit in analyze", () => {
 		const decision = decideToolCall(stateInPhase("analyze"), "edit", {});

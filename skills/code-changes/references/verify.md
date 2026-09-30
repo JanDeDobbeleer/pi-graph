@@ -14,6 +14,9 @@ work by default.
 - Cross-compile or re-lint for every target platform when platform-specific files changed — the
   local toolchain skips the other platform's rules. The language skill names how those files are
   marked.
+- A gate that cannot run in the environment (program not installed, command written for a
+  different shell) is a gate-definition problem, not a product failure: fix the gate with the
+  user's approval, never by skipping it.
 
 ## Functional proof
 

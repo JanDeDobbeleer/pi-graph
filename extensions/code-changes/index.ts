@@ -34,8 +34,14 @@ import {
 	applyPlan,
 	applyReview,
 	analysisGateChoices,
+	applyGateAmendment,
 	applyVerification,
 	buildPackets,
+	buildPreviousRunSummary,
+	formatGateAmendments,
+	resumeTargetFor,
+	validateGateAmendment,
+	type GateAmendmentRequest,
 	formatAnalysis,
 	hasProposedChange,
 	formatPlan,
@@ -52,6 +58,7 @@ import {
 import { CiWatcher, detectPrFromText, formatCiFailure, isPushCommand, resolvePr, type WatchResult } from "./ci.ts";
 import { cleanupWorktrees, mergedDiff, runDelegation } from "./delegate.ts";
 import { runEscalation } from "./escalate.ts";
+import { checkGateCommands } from "./gatecheck.ts";
 import { decideToolCall, READ_ONLY_PHASES, toolsForPhase, WORKFLOW_TOOLS } from "./gates.ts";
 import { discoverStopHooks, findRepoRoot, formatHookFeedback, hooksBlocked, runStopHooks, StopHookGuard, type StopHook } from "./hooks.ts";
 import { loadMaxParallel, loadReadOnlyTools, loadTierConfig, modelRef, resolveTierModel, tierForExecutor } from "./models.ts";
@@ -59,6 +66,7 @@ import { phasePrompt, phaseReminder } from "./prompts.ts";
 import { createResumeTaskTool, escalateSpecGaps, needsSpecGapEscalation, type ResumeDeps } from "./resume.ts";
 import { isTransientProviderError, MAX_TRANSIENT_RETRIES, retryBackoff } from "./retry.ts";
 import { git, runShell } from "./runner.ts";
+import { resolveGateShell } from "./shell.ts";
 import {
 	newState,
 	PHASE_LABEL,
@@ -82,6 +90,14 @@ import {
 const MODEL_DRIVEN_PHASES: ReadonlySet<Phase> = new Set(["analyze", "plan", "delegate", "supervise", "verify", "deliver"]);
 
 const PHASE_PROMPT_MESSAGE = "code-changes-phase-prompt";
+/** Marks where `/change resume` reset the retry count: failures before `failureCount` no longer count. */
+const RESUME_ENTRY = "code-changes-resume";
+/** An amend_gate request waiting for the user's `/change amend-gate approve|reject` (no UI to ask). */
+const PENDING_AMENDMENT_ENTRY = "code-changes-pending-amendment";
+
+interface PendingAmendment extends GateAmendmentRequest {
+	runId: string;
+}
 
 interface PhasePromptDetails {
 	phase: Phase;
@@ -96,6 +112,19 @@ const CI_FIX_CAP = 2;
 
 export default function codeChanges(pi: ExtensionAPI): void {
 	let state: WorkflowState | undefined;
+	/** Index into `state.failures` from which the retry count restarts (raised by /change resume). */
+	let countFrom = 0;
+	let pendingAmendment: PendingAmendment | undefined;
+
+	function setPendingAmendment(next: PendingAmendment | undefined): void {
+		pendingAmendment = next;
+		pi.appendEntry(PENDING_AMENDMENT_ENTRY, { pending: next ?? null });
+	}
+
+	/** Moves the run to "stopped", remembering where it stopped so `/change resume` can reopen it. */
+	function stopRun(current: WorkflowState, reason: string): WorkflowState {
+		return transition({ ...current, stopReason: reason, stoppedFrom: resumeTargetFor(current.phase) }, "stopped");
+	}
 
 	// -------------------------------------------------------------------------
 	// Extra read-only tools (from other extensions) activated in Analyze/Plan/Supervise/Verify.
@@ -300,6 +329,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	async function takePhasePrompt(ctx: ExtensionContext, extra?: string) {
 		const current = state!;
 		await applyCoordinatorModel(ctx);
+		await resolveGateShell(ctx.cwd); // so the Plan/Verify prompts can name the gate shell
 		state = { ...current, phasePromptSent: true };
 		persist();
 		const details: PhasePromptDetails = { phase: current.phase, runId: current.id, extra: extra !== undefined && extra.trim() !== "" };
@@ -552,8 +582,8 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		}
 
 		if (choice === "Stop the run") {
-			const stopped = { ...state, stopReason: "stopped by user at the approval gate" };
-			setState(transition(stopped, "stopped"), ctx);
+			const stopped = stopRun(state, "stopped by user at the approval gate");
+			setState(stopped, ctx);
 			await enterPhase(ctx);
 			return;
 		}
@@ -655,8 +685,8 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		}
 
 		if (choice === "Stop the run") {
-			const stopped = { ...state, stopReason: "stopped by user at the plan approval gate" };
-			setState(transition(stopped, "stopped"), ctx);
+			const stopped = stopRun(state, "stopped by user at the plan approval gate");
+			setState(stopped, ctx);
 			await enterPhase(ctx);
 			return;
 		}
@@ -666,7 +696,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	// /change command
 	// -------------------------------------------------------------------------
 
-	const SUBCOMMANDS = ["status", "approve", "revise", "abort", "cleanup", "watch", "show", "triage", "review", "allow-push", "resume", "choose", "done"];
+	const SUBCOMMANDS = ["status", "approve", "revise", "abort", "cleanup", "watch", "show", "triage", "review", "allow-push", "resume", "choose", "done", "amend-gate"];
 
 	/** Parses `--approved`/`--push` flags (any order, any combination) preceding the rest of the args. */
 	function parseFlags(args: string): { preApproved: boolean; pushAllowed: boolean; remainder: string } {
@@ -695,6 +725,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		task: string,
 		opts: { preApproved: boolean; pushAllowed: boolean; entry?: EntryKind; entryRef?: string },
 	): Promise<void> {
+		let previous: WorkflowState | undefined = state;
 		if (isActive(state)) {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("code-changes: a run is already active; use /change abort first.", "error");
@@ -706,8 +737,8 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			);
 			if (!replace) return;
 			if (state.pr) ciWatcher.stop(state.pr.number);
-			const aborted = { ...state, stopReason: "replaced by a new /change run" };
-			const stopped = transition(aborted, "stopped");
+			const stopped = stopRun(state, "replaced by a new /change run");
+			previous = stopped;
 			await cleanupWorktrees(stopped.runs, ctx.cwd);
 		}
 
@@ -723,6 +754,12 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			entry: opts.entry,
 			entryRef: opts.entryRef,
 		});
+		// A follow-up run in the same session starts with a recap of the one that just finished or stopped.
+		if (previous && (previous.phase === "done" || previous.phase === "stopped")) {
+			next.previousRun = buildPreviousRunSummary(previous);
+		}
+		countFrom = 0;
+		if (pendingAmendment) setPendingAmendment(undefined);
 		setState(next, ctx);
 		await enterPhase(ctx);
 	}
@@ -730,7 +767,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	pi.registerCommand("change", {
 		description:
 			"Start or control the code-changes workflow: /change [--approved] [--push] <task>, /change triage|review [--approved] [--push] <ref>, " +
-			"or status/approve/choose/done/revise/abort/cleanup/watch/show/allow-push/resume",
+			"or status/approve/choose/done/revise/abort/cleanup/watch/show/allow-push/resume/amend-gate",
 		getArgumentCompletions(argumentPrefix: string) {
 			return SUBCOMMANDS.filter((s) => s.startsWith(argumentPrefix)).map((s) => ({ value: s, label: s }));
 		},
@@ -745,8 +782,41 @@ export default function codeChanges(pi: ExtensionAPI): void {
 					return;
 				}
 				ctx.ui.notify(
-					`code-changes: run ${state.id} — task "${state.task}" — phase ${PHASE_LABEL[state.phase]} — failures ${state.failures.length}.`,
+					`code-changes: run ${state.id} — task "${state.task}" — phase ${PHASE_LABEL[state.phase]} — failures ${state.failures.length}.` +
+						(state.phase === "stopped" && state.stoppedFrom ? ` Stopped — /change resume to reopen ${PHASE_LABEL[state.stoppedFrom]}.` : "") +
+						(pendingAmendment ? ` A gate amendment awaits your decision: /change amend-gate approve|reject.` : ""),
 					"info",
+				);
+				return;
+			}
+
+			if (first === "amend-gate") {
+				const decision = rest[0];
+				if (!pendingAmendment || !state || pendingAmendment.runId !== state.id) {
+					ctx.ui.notify("code-changes: no gate amendment is pending.", "info");
+					return;
+				}
+				const { runId: _runId, ...request } = pendingAmendment;
+				const describe = `${request.gate} → ${request.replacement ?? "(removed)"}\nReason: ${request.reason}`;
+				if (decision !== "approve" && decision !== "reject") {
+					ctx.ui.notify(`code-changes: pending gate amendment:\n${describe}\nRun /change amend-gate approve or /change amend-gate reject.`, "info");
+					return;
+				}
+				setPendingAmendment(undefined);
+				if (decision === "reject") {
+					ctx.ui.notify("code-changes: gate amendment rejected. The gate stays as planned.", "info");
+					return;
+				}
+				try {
+					setState(applyGateAmendment(state, request, new Date().toISOString()), ctx);
+				} catch (err) {
+					ctx.ui.notify(`code-changes: ${err instanceof Error ? err.message : String(err)}`, "warning");
+					return;
+				}
+				ctx.ui.notify(`code-changes: gate amended.\n${describe}\nTell the model to continue (it can now run the amended gate).`, "info");
+				pi.sendMessage(
+					{ customType: "code-changes-phase", content: `The user approved the gate amendment:\n${describe}\nContinue ${PHASE_LABEL[state.phase]} with the amended gate.`, display: true },
+					{ triggerTurn: true, deliverAs: "followUp" },
 				);
 				return;
 			}
@@ -823,6 +893,25 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			}
 
 			if (first === "resume") {
+				if (state?.phase === "stopped") {
+					const target = state.stoppedFrom ? resumeTargetFor(state.stoppedFrom) : undefined;
+					if (!target) {
+						ctx.ui.notify("code-changes: this run cannot be reopened; start a new one with /change <task>.", "warning");
+						return;
+					}
+					const reason = state.stopReason ?? "unknown reason";
+					if (ctx.hasUI) {
+						const go = await ctx.ui.confirm("Resume the stopped run?", `${reason}\nThis reopens ${PHASE_LABEL[target]} with the retry count reset.`);
+						if (!go) return;
+					}
+					// Failures so far stay on record for history but no longer count toward the retry cap.
+					countFrom = state.failures.length;
+					pi.appendEntry(RESUME_ENTRY, { runId: state.id, failureCount: countFrom });
+					const reopened = transition({ ...state, stopReason: undefined, stoppedFrom: undefined }, target);
+					setState(reopened, ctx);
+					await enterPhase(ctx, `Resumed by the user after a stop: ${reason}. Continue ${PHASE_LABEL[target]}; the retry count was reset.`);
+					return;
+				}
 				if (!isActive(state)) {
 					ctx.ui.notify("code-changes: no active run.", "info");
 					return;
@@ -857,8 +946,8 @@ export default function codeChanges(pi: ExtensionAPI): void {
 					return;
 				}
 				if (state.pr) ciWatcher.stop(state.pr.number);
-				const aborted = { ...state, stopReason: "aborted by user" };
-				setState(transition(aborted, "stopped"), ctx);
+				const aborted = stopRun(state, "aborted by user");
+				setState(aborted, ctx);
 				await cleanupWorktrees(state.runs, ctx.cwd);
 				ctx.ui.notify("code-changes: run aborted.", "warning");
 				return;
@@ -954,7 +1043,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			const { preApproved, pushAllowed, remainder: task } = parseFlags(trimmed);
 			if (!task) {
 				ctx.ui.notify(
-					"code-changes: usage: /change [--approved] [--push] <task>, or /change status|approve|choose|done|revise|abort|cleanup|watch|show|triage|review|allow-push|resume",
+					"code-changes: usage: /change [--approved] [--push] <task>, or /change status|approve|choose|done|revise|abort|cleanup|watch|show|triage|review|allow-push|resume|amend-gate",
 					"warning",
 				);
 				return;
@@ -1009,11 +1098,21 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			}
 			try {
 				let next = applyPlan(state, params);
+				// Required gates are frozen with the plan: reject programs the gate shell does not have now,
+				// while the model can still rewrite them, instead of failing Verify later.
+				const shell = await resolveGateShell(ctx.cwd);
+				const gateCheck = await checkGateCommands(
+					params.tasks.flatMap((t) => t.verification_commands),
+					ctx.cwd,
+					shell,
+				);
+				if (gateCheck.message) throw new Error(gateCheck.message);
 				next = { ...next, packets: buildPackets(next.plan!) };
 				setState(next, ctx);
 				const formatted = next.plan ? formatPlan(next.plan, { execution: await planExecutionOptions(next.plan, ctx) }) : "";
+				const warning = gateCheck.warning ? `\n\nWarning: ${gateCheck.warning}; the gates were not checked.` : "";
 				return {
-					content: [{ type: "text", text: `Plan submitted with ${next.plan?.tasks.length ?? 0} task(s). Phase is now ${PHASE_LABEL[next.phase]}.\n\n${formatted}` }],
+					content: [{ type: "text", text: `Plan submitted with ${next.plan?.tasks.length ?? 0} task(s). Phase is now ${PHASE_LABEL[next.phase]}.${warning}\n\n${formatted}` }],
 					details: next.plan,
 					terminate: true,
 				};
@@ -1142,13 +1241,20 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			persist();
 
 			const table = results
-				.map((r) => `| ${r.command} | ${r.exit_code} | ${r.duration_ms}ms |`)
+				.map((r) => `| ${r.command} | ${r.exit_code}${r.runnable === false ? " (not runnable)" : ""} | ${r.shell ?? ""} | ${r.duration_ms}ms |`)
 				.join("\n");
 			const failing = results.filter((r) => r.exit_code !== 0);
-			const failingOutputs = failing.map((r) => `## ${r.command} (exit ${r.exit_code})\n${r.output}`).join("\n\n");
+			const failingOutputs = failing
+				.map((r) =>
+					r.runnable === false
+						? `## NOT RUNNABLE (environment): ${r.command} (exit ${r.exit_code}, shell ${r.shell ?? "unknown"})\nThe command could not run in this shell (program or path not found), so this says nothing about the change. ` +
+							`It is a gate-definition problem: use amend_gate to replace it with a command that works here (the user approves), do not skip it.\n${r.output}`
+						: `## ${r.command} (exit ${r.exit_code})\n${r.output}`,
+				)
+				.join("\n\n");
 			const text = [
-				"| command | exit | duration |",
-				"| --- | --- | --- |",
+				"| command | exit | shell | duration |",
+				"| --- | --- | --- | --- |",
 				table,
 				failingOutputs ? `\n${failingOutputs}` : "",
 			]
@@ -1188,7 +1294,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 
 			let outcome;
 			try {
-				outcome = applyVerification(state, params);
+				outcome = applyVerification(state, params, { countFrom });
 			} catch (err) {
 				if (err instanceof ArtifactError) throw new Error(err.message);
 				throw err;
@@ -1212,7 +1318,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			const config = loadTierConfig(ctx.cwd);
 			const resolved = resolveTierModel(ctx.modelRegistry, config, "escalation", ctx.model);
 			if (!resolved.model) {
-				const stopped = transition({ ...outcome.state, stopReason: "Escalation model could not be resolved after a second Verify failure." }, "stopped");
+				const stopped = stopRun(outcome.state, "Escalation model could not be resolved after a second Verify failure.");
 				setState(stopped, ctx);
 				return { content: [{ type: "text", text: `Escalation could not run: no model resolved for the escalation tier. Run stopped.` }], details: undefined, terminate: true };
 			}
@@ -1246,7 +1352,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 				return { content: [{ type: "text", text: `Escalation decision: ${decision}\n\nRouted to ${PHASE_LABEL[resolvedState.phase]}.` }], details: escalation, terminate: true };
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
-				const stopped = transition({ ...outcome.state, stopReason: `Escalation call failed: ${message}` }, "stopped");
+				const stopped = stopRun(outcome.state, `Escalation call failed: ${message}`);
 				setState(stopped, ctx);
 				return { content: [{ type: "text", text: `Escalation call failed: ${message}. Run stopped.` }], details: undefined, terminate: true };
 			}
@@ -1315,6 +1421,63 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			state = { ...state, escalations: [...state.escalations, escalation] };
 			persist();
 			return { content: [{ type: "text", text: decision }], details: escalation };
+		},
+	});
+
+	pi.registerTool({
+		name: "amend_gate",
+		label: "Amend gate",
+		description:
+			"Replace or remove one required gate command (Supervise or Verify). Use it when a gate is wrong or cannot run in the gate shell (run_gates reports NOT RUNNABLE). " +
+			"The user must approve every amendment. Never use it to weaken a meaningful check.",
+		parameters: Type.Object({
+			gate: Type.String({ description: "The exact required gate command to amend." }),
+			replacement: Type.Optional(Type.String({ description: "The command that replaces it; omit to remove the gate." })),
+			reason: Type.String({ description: "Why the gate must change (what is wrong with it, why the replacement checks the same thing)." }),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (!state || (state.phase !== "supervise" && state.phase !== "verify")) {
+				throw new Error(`amend_gate is only valid in Supervise or Verify (current: ${state ? state.phase : "no active run"}).`);
+			}
+			let request: GateAmendmentRequest;
+			try {
+				request = { gate: validateGateAmendment(state, params), replacement: params.replacement?.trim(), reason: params.reason };
+			} catch (err) {
+				if (err instanceof ArtifactError) throw new Error(err.message);
+				throw err;
+			}
+			if (request.replacement) {
+				const check = await checkGateCommands([request.replacement], ctx.cwd, await resolveGateShell(ctx.cwd));
+				if (check.message) throw new Error(check.message);
+			}
+
+			const describe = `${request.gate} → ${request.replacement ?? "(removed)"}\nReason: ${request.reason}`;
+			if (ctx.hasUI) {
+				const approved = await ctx.ui.confirm("Amend a required gate?", describe);
+				if (!approved) return { content: [{ type: "text", text: "The user declined; keep the gate or ask the user." }], details: request };
+				if (!state) throw new Error("amend_gate: the run ended while waiting for the user.");
+				try {
+					setState(applyGateAmendment(state, request, new Date().toISOString()), ctx);
+				} catch (err) {
+					if (err instanceof ArtifactError) throw new Error(err.message);
+					throw err;
+				}
+				return {
+					content: [{ type: "text", text: `The user approved the amendment. Required gates are now: ${requiredGateCommands(state!).map((c) => `\`${c}\``).join(", ") || "(none)"}.` }],
+					details: request,
+				};
+			}
+
+			setPendingAmendment({ ...request, runId: state.id });
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Amendment recorded as pending (no interactive UI to ask): ${describe}\nAsk the user to run /change amend-gate approve (or reject). Do not continue until they have decided.`,
+					},
+				],
+				details: request,
+			};
 		},
 	});
 
@@ -1509,6 +1672,22 @@ export default function codeChanges(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		state = restoreState(ctx.sessionManager.getBranch() as unknown as ReadonlyArray<{ type: string; customType?: string; data?: unknown }>);
+		countFrom = 0;
+		pendingAmendment = undefined;
+		if (state) {
+			// Rebuild the module-level markers that live outside WorkflowState (state.ts is the fixed contract).
+			const branch = ctx.sessionManager.getBranch() as unknown as ReadonlyArray<{ type: string; customType?: string; data?: unknown }>;
+			for (const entry of branch) {
+				if (entry.type !== "custom") continue;
+				if (entry.customType === RESUME_ENTRY) {
+					const data = entry.data as { runId?: string; failureCount?: number } | undefined;
+					if (data?.runId === state.id && typeof data.failureCount === "number") countFrom = data.failureCount;
+				} else if (entry.customType === PENDING_AMENDMENT_ENTRY) {
+					const data = entry.data as { pending?: PendingAmendment | null } | undefined;
+					pendingAmendment = data?.pending && data.pending.runId === state.id ? data.pending : undefined;
+				}
+			}
+		}
 		hooksDiscovered = false;
 		stopHookGuard.reset();
 		await discoverHooks(ctx.cwd);

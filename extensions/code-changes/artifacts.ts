@@ -11,7 +11,7 @@ import { DEFAULT_MAX_PARALLEL } from "./delegate.ts";
 import { isSubAgentTask, planWorkspaces, topologicalWaves, worktreeTaskIds } from "./planning.ts";
 import { independent, overlappingPatterns } from "./paths.ts";
 import { transition, type WorkflowState, type PlanTask, type TaskList, type ExecutorTier, type FailureRecord, type PullRequestRef, type AnalysisReport, type AnalysisKind, type AnalysisOption, ANALYSIS_KINDS } from "./state.ts";
-import type { GateResult } from "./state.ts";
+import type { GateAmendment, GateResult, Phase } from "./state.ts";
 
 // ---------------------------------------------------------------------------
 // 1. Schemas
@@ -899,9 +899,13 @@ export function applyReview(state: WorkflowState, r: ReviewParams, mergedDiff: s
 // 8. Verify gate bookkeeping
 // ---------------------------------------------------------------------------
 
+/**
+ * The gates Verify requires: the plan's verification commands with the human-approved
+ * amendments applied in order (a replacement swaps the gate in place, a removal drops it).
+ */
 export function requiredGateCommands(state: WorkflowState): string[] {
 	const seen = new Set<string>();
-	const commands: string[] = [];
+	let commands: string[] = [];
 	for (const task of state.plan?.tasks ?? []) {
 		for (const cmd of task.verification_commands) {
 			if (!seen.has(cmd)) {
@@ -910,7 +914,92 @@ export function requiredGateCommands(state: WorkflowState): string[] {
 			}
 		}
 	}
+	for (const a of state.gateAmendments ?? []) {
+		const at = commands.findIndex((c) => c.trim() === a.old.trim());
+		if (at === -1) continue;
+		const replacement = a.new?.trim();
+		if (!replacement) {
+			commands = commands.filter((_, i) => i !== at);
+		} else if (commands.some((c, i) => i !== at && c.trim() === replacement)) {
+			commands = commands.filter((_, i) => i !== at); // already required: just drop the old one
+		} else {
+			commands = commands.map((c, i) => (i === at ? replacement : c));
+		}
+	}
 	return commands;
+}
+
+/** The amendment to apply: which required gate, what replaces it (omit to remove), and why. */
+export interface GateAmendmentRequest {
+	gate: string;
+	replacement?: string;
+	reason: string;
+}
+
+/** Checks an amendment request against the current required gates; returns the exact gate it targets. */
+export function validateGateAmendment(state: WorkflowState, req: GateAmendmentRequest): string {
+	if (state.phase !== "supervise" && state.phase !== "verify") {
+		throw new ArtifactError(`amend_gate is only valid in Supervise or Verify (current: ${state.phase}).`);
+	}
+	const required = requiredGateCommands(state);
+	const target = required.find((c) => c.trim() === req.gate.trim());
+	if (target === undefined) {
+		throw new ArtifactError(
+			`"${req.gate}" is not a required gate. Required gates: ${required.length > 0 ? required.map((c) => `\`${c}\``).join(", ") : "(none)"}.`,
+		);
+	}
+	if (!req.reason.trim()) throw new ArtifactError("amend_gate: reason is required.");
+	if (req.replacement !== undefined && req.replacement.trim() === "") {
+		throw new ArtifactError("amend_gate: replacement is empty; omit it to remove the gate.");
+	}
+	if (req.replacement !== undefined && req.replacement.trim() === target.trim()) {
+		throw new ArtifactError("amend_gate: the replacement is identical to the gate.");
+	}
+	return target;
+}
+
+/**
+ * Records a human-approved gate amendment and drops the amended gate's stale result from
+ * `lastGates`, so a failing or not-runnable run of the old command cannot block the new gate set.
+ */
+export function applyGateAmendment(state: WorkflowState, req: GateAmendmentRequest, approvedAt: string): WorkflowState {
+	const target = validateGateAmendment(state, req);
+	const amendment: GateAmendment = {
+		old: target,
+		new: req.replacement?.trim(),
+		reason: req.reason.trim(),
+		phase: state.phase,
+		approved_at: approvedAt,
+	};
+	return {
+		...state,
+		gateAmendments: [...(state.gateAmendments ?? []), amendment],
+		lastGates: state.lastGates.filter((g) => g.command.trim() !== target.trim()),
+	};
+}
+
+/** One line per amendment, for the review / Deliver report. */
+export function formatGateAmendments(amendments: GateAmendment[] | undefined): string[] {
+	return (amendments ?? []).map((a) => `\`${a.old}\` → ${a.new ? `\`${a.new}\`` : "removed"} (${a.reason}; approved by the user in ${a.phase})`);
+}
+
+/** The phase `/change resume` reopens for a run that stopped from `from`, or undefined when it cannot be reopened. */
+export function resumeTargetFor(from: Phase): Phase | undefined {
+	switch (from) {
+		case "analyze":
+		case "plan":
+		case "supervise":
+		case "verify":
+		case "deliver":
+			return from;
+		case "awaiting_approval":
+			return "analyze";
+		case "awaiting_plan_approval":
+		case "delegate":
+			return "plan";
+		default:
+			return undefined;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -933,7 +1022,7 @@ function gatesSatisfy(lastGates: GateResult[], required: string[]): { ok: boolea
 		const result = byCommand.get(cmd.trim());
 		if (!result) {
 			missing.push(cmd);
-		} else if (result.exit_code !== 0) {
+		} else if (result.exit_code !== 0 || result.runnable === false) {
 			failing.push(cmd);
 		}
 	}
@@ -945,11 +1034,26 @@ function gatesSatisfy(lastGates: GateResult[], required: string[]): { ok: boolea
 
 function formatFailureHistory(failures: FailureRecord[]): string {
 	return failures
-		.map((f) => `- Attempt ${f.attempt_number}: ${f.failure_class} -> ${f.destination}. ${f.summary}`)
+		.map((f) =>
+			f.harness
+				? `- Environment issue (not counted): gate(s) could not run. ${f.summary}`
+				: `- Attempt ${f.attempt_number}: ${f.failure_class} -> ${f.destination}. ${f.summary}`,
+		)
 		.join("\n");
 }
 
-export function applyVerification(state: WorkflowState, v: VerificationParams): VerifyOutcome {
+export interface VerificationOptions {
+	/** Failures before this index were reset by `/change resume`; they no longer count toward the retry cap. */
+	countFrom?: number;
+}
+
+/** Failures that count toward the retry cap: not environment (harness) failures, and not before the last resume. */
+export function countedFailures(state: WorkflowState, countFrom = 0): FailureRecord[] {
+	return state.failures.slice(countFrom).filter((f) => !f.harness);
+}
+
+export function applyVerification(state: WorkflowState, v: VerificationParams, opts: VerificationOptions = {}): VerifyOutcome {
+	const countFrom = opts.countFrom ?? 0;
 	if (state.phase !== "verify") {
 		throw new ArtifactError(`Cannot submit verification while in phase "${state.phase}"; expected "verify".`);
 	}
@@ -983,7 +1087,7 @@ export function applyVerification(state: WorkflowState, v: VerificationParams): 
 		const evidence = {
 			gates_run: state.lastGates,
 			functional_proof: v.functional_proof,
-			retry_count: state.failures.length,
+			retry_count: countedFailures(state, countFrom).length,
 		};
 		const next = transition({ ...state, evidence }, "deliver");
 		return { kind: "deliver", state: next };
@@ -1006,7 +1110,24 @@ export function applyVerification(state: WorkflowState, v: VerificationParams): 
 		state = { ...state, ciFailure: undefined };
 	}
 
-	const attempt_number = state.failures.length + 1;
+	// Every failing required gate could not run at all (program missing in the gate shell): the
+	// environment or the gate definition is broken, not the change. Never counts toward the cap.
+	const required = new Set(requiredGateCommands(state).map((c) => c.trim()));
+	const failingRequired = state.lastGates.filter((g) => g.exit_code !== 0 && required.has(g.command.trim()));
+	if (failingRequired.length > 0 && failingRequired.every((g) => g.runnable === false)) {
+		const failure: FailureRecord = {
+			attempt_number: countedFailures(state, countFrom).length + 1,
+			failure_class: v.failure_class,
+			destination: "supervise",
+			summary: failureSummary,
+			harness: true,
+		};
+		const next = transition({ ...state, failures: [...state.failures, failure] }, "supervise");
+		return { kind: "retry", state: next, failure };
+	}
+
+	const counted = countedFailures(state, countFrom);
+	const attempt_number = counted.length + 1;
 	const destination: "supervise" | "analyze" = v.failure_class === "wrong_root_cause" ? "analyze" : "supervise";
 	const failure: FailureRecord = {
 		attempt_number,
@@ -1015,13 +1136,13 @@ export function applyVerification(state: WorkflowState, v: VerificationParams): 
 		summary: failureSummary,
 	};
 
-	const priorEscalated = state.failures.some((f) => f.escalation_answer !== undefined);
+	const priorEscalated = counted.some((f) => f.escalation_answer !== undefined);
 
 	if (priorEscalated) {
 		// Attempt >= 3: stop, do not route further.
 		const stopped = { ...state, failures: [...state.failures, failure] };
 		const finalState = transition(stopped, "stopped");
-		const finalState2 = { ...finalState, stopReason: "Verify failed again after an escalation; stopping for the user." };
+		const finalState2 = { ...finalState, stopReason: "Verify failed again after an escalation; stopping for the user.", stoppedFrom: "verify" as Phase };
 		const escalationEntry = [...state.escalations].reverse().find((e) => e.phase === "verify");
 		const priorFailureWithAnswer = state.failures.find((f) => f.escalation_answer !== undefined);
 		const failingGates = state.lastGates.filter((g) => g.exit_code !== 0);
@@ -1115,10 +1236,42 @@ function truncate(s: string, max: number): string {
 	return s.length > max ? `${s.slice(0, max)}...` : s;
 }
 
+/** Repo-relative paths named in a unified diff's `diff --git` headers, first `max` of them. */
+function changedFiles(diff: string, max: number): string[] {
+	const files: string[] = [];
+	for (const m of diff.matchAll(/^diff --git a\/(.+?) b\/.+$/gm)) {
+		if (!files.includes(m[1])) files.push(m[1]);
+	}
+	return files.length > max ? [...files.slice(0, max), `+${files.length - max} more`] : files;
+}
+
+/**
+ * Compact recap of a finished (done or stopped) run, carried into a follow-up `/change` run in the
+ * same session so the model does not start from zero: task, kind, findings, proposed change, the
+ * delivery report or stop reason, and the files changed when known.
+ */
+export function buildPreviousRunSummary(state: WorkflowState): string {
+	const lines: string[] = [`Task: ${truncate(state.task, 200)}`];
+	lines.push(`Outcome: ${state.phase === "done" ? "done" : `stopped${state.stopReason ? ` (${truncate(state.stopReason, 200)})` : ""}`}`);
+	if (state.analysis) {
+		lines.push(`Kind: ${state.analysis.kind}`);
+		lines.push(`Findings: ${truncate(state.analysis.findings, 600)}`);
+		if (state.analysis.proposed_change.trim()) lines.push(`Proposed change: ${truncate(state.analysis.proposed_change, 400)}`);
+	}
+	if (state.delivery) lines.push(`Delivery report: ${truncate(state.delivery.report, 600)}`);
+	else if (state.phase === "stopped" && state.stopReason) lines.push(`Stop reason: ${truncate(state.stopReason, 600)}`);
+	const files = state.review ? changedFiles(state.review.merged_diff, 15) : [];
+	if (files.length > 0) lines.push(`Files changed: ${files.join(", ")}`);
+	return lines.join("\n");
+}
+
 export function summarizeState(state: WorkflowState): string {
 	const lines: string[] = [];
 	lines.push(`# Prior state for "${state.task}"`);
 	lines.push(`Phase: ${state.phase}`);
+	if (state.previousRun) {
+		lines.push(`Previous run in this session: ${truncate(state.previousRun.split("\n")[0], 160)}`);
+	}
 
 	if (state.analysis) {
 		lines.push("");
@@ -1164,6 +1317,12 @@ export function summarizeState(state: WorkflowState): string {
 		lines.push(`- overrides: ${state.review.overrides.join("; ") || "none"}`);
 		lines.push(`- tests_kept: ${state.review.tests_kept.join("; ") || "none"}`);
 		lines.push(`- tests_cut: ${state.review.tests_cut.join("; ") || "none"}`);
+	}
+
+	if (state.gateAmendments && state.gateAmendments.length > 0) {
+		lines.push("");
+		lines.push("## Gate amendments (approved by the user)");
+		lines.push(...formatGateAmendments(state.gateAmendments).map((l) => `- ${l}`));
 	}
 
 	if (state.failures.length > 0) {

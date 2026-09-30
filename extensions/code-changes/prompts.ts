@@ -19,8 +19,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { requiredGateCommands, summarizeState } from "./artifacts.ts";
+import { formatGateAmendments, requiredGateCommands, summarizeState } from "./artifacts.ts";
 import { PHASE_ARTIFACT_TOOL, PHASE_TOOLS } from "./gates.ts";
+import { knownGateShellLabel } from "./shell.ts";
 import { PHASE_LABEL, type AnalysisKind, type Phase, type WorkflowState } from "./state.ts";
 
 // ---------------------------------------------------------------------------
@@ -192,6 +193,11 @@ const EXTERNAL_CONTEXT_LINE =
 const PLAN_PARALLELISM_LINE =
 	"Split work by folder: give every sub-agent task `paths` (the folders/files/globs it may change). Independent tasks with non-overlapping paths run in parallel in separate worktrees automatically; overlapping independent tasks are rejected — add a dependency or merge them. Set requires_main_tree only when the task needs uncommitted local changes.";
 
+function gateShellPhrase(): string {
+	const label = knownGateShellLabel();
+	return label ? `${label} (the same shell as your bash tool)` : "the same shell as your bash tool";
+}
+
 function phaseExtra(state: WorkflowState): string | undefined {
 	switch (state.phase) {
 		case "analyze": {
@@ -213,7 +219,11 @@ function phaseExtra(state: WorkflowState): string | undefined {
 			return lines.join("\n");
 		}
 		case "plan":
-			return [EXTERNAL_CONTEXT_LINE, PLAN_PARALLELISM_LINE].join("\n");
+			return [
+				EXTERNAL_CONTEXT_LINE,
+				PLAN_PARALLELISM_LINE,
+				`Verification commands run in ${gateShellPhrase()}; write them for that shell. The harness checks that the programs they invoke exist there when you submit the plan and rejects the plan otherwise.`,
+			].join("\n");
 		case "delegate":
 			return "Call run_delegation now; it dispatches the plan's tasks.";
 		case "supervise": {
@@ -261,6 +271,11 @@ function phaseExtra(state: WorkflowState): string | undefined {
 					: "This plan listed no verification_commands; running run_gates with an empty list is not valid — report the gap instead.",
 			);
 			lines.push("Bash results do not count as gate evidence. A pass is rejected unless every required gate is green in the latest run_gates result.");
+			lines.push(`Gates run in ${gateShellPhrase()}.`);
+			lines.push(
+				"A gate reported as NOT RUNNABLE (environment) cannot run in that shell at all: it is a gate-definition problem, not a product failure, and does not count toward the retry cap. " +
+					"Fix it with amend_gate (replace the gate with a command that works, or remove it; the user must approve the amendment). Never use amend_gate to weaken a meaningful check.",
+			);
 			const lastFailure = state.failures[state.failures.length - 1];
 			if (lastFailure) {
 				lines.push("");
@@ -275,10 +290,14 @@ function phaseExtra(state: WorkflowState): string | undefined {
 			return lines.join("\n");
 		}
 		case "deliver": {
+			const amendments = formatGateAmendments(state.gateAmendments);
 			const lines: string[] = [
 				"Commit with conventional commits (subjects are validated against git log since the base ref), then call submit_delivery with an outcome-first report.",
 				`Push policy: ${pushPolicyLines(state).join(" ")}`,
 			];
+			if (amendments.length > 0) {
+				lines.push(`Required gates were amended during this run with the user's approval; state this in the report:\n${amendments.map((a) => `- ${a}`).join("\n")}`);
+			}
 			return lines.join("\n");
 		}
 		case "ci":
@@ -298,6 +317,13 @@ export function phasePrompt(state: WorkflowState, extra?: string): string {
 	lines.push(`## Task\n${state.task}`);
 	lines.push("");
 	lines.push(HARNESS_IS_THE_FLOW);
+
+	if (state.previousRun && state.phase === "analyze") {
+		lines.push("");
+		lines.push("## Previous run in this session");
+		lines.push("Context only: this is a new request; use the previous run's findings and outcome where they are relevant, but check they still hold.");
+		lines.push(state.previousRun);
+	}
 
 	const references = referencesForPhase(state);
 	for (const name of references) {
