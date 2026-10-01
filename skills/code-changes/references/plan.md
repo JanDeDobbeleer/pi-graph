@@ -43,10 +43,13 @@ Write the spec down before delegating anything. It contains:
 
 ## Decide the workspace per task
 
-- Main working tree: when the task depends on uncommitted local changes, or when you will review
-  and commit the result in the current session.
+- Main working tree: only when the task truly must run there (e.g. it needs local services or
+  state that is not in git, set `requires_main_tree`), or when you will review and commit the
+  result in the current session. Uncommitted changes are not a reason: worktrees start from a
+  snapshot of them and the results are applied back onto the main tree.
 - Isolated worktree: everything else, especially parallel tasks — they must never share a
-  working tree.
+  working tree. When there are 2+ independent groups of files/folders, split them into separate
+  sub-agent tasks with non-overlapping `paths` so they run in parallel.
 
 ## Plan the merge
 

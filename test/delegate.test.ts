@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { cleanupWorktrees, mergedDiff, parseSpecGaps, runDelegation, topoWaves } from "../extensions/code-changes/delegate.ts";
+import { cleanupWorktrees, mergedDiff, parseSpecGaps, runDelegation, snapshotDirtyTree, topoWaves } from "../extensions/code-changes/delegate.ts";
 import { git, runShell } from "../extensions/code-changes/runner.ts";
 import type { DelegationPacket, PlanTask, TaskList } from "../extensions/code-changes/state.ts";
 
@@ -268,6 +268,114 @@ describe("runDelegation (integration)", () => {
 					runAgent: fakeWriterAgent("solo.txt", "solo\n"),
 				});
 				expect(mergeLog.some((line) => line.includes("uncommitted changes"))).toBe(true);
+				await cleanupWorktrees(runs, repo);
+			} finally {
+				await rmrf(repo);
+			}
+		},
+		TIMEOUT,
+	);
+
+	it(
+		"snapshotDirtyTree returns undefined on a clean tree",
+		async () => {
+			const repo = await makeTempRepo();
+			try {
+				expect(await snapshotDirtyTree(repo)).toBeUndefined();
+			} finally {
+				await rmrf(repo);
+			}
+		},
+		TIMEOUT,
+	);
+
+	it(
+		"snapshotDirtyTree commits modified and untracked files without touching the main tree",
+		async () => {
+			const repo = await makeTempRepo();
+			try {
+				await fs.promises.writeFile(path.join(repo, "README.md"), "# changed\n", "utf-8");
+				await fs.promises.writeFile(path.join(repo, "new.txt"), "untracked\n", "utf-8");
+				const before = (await git(["status", "--porcelain"], repo)).stdout;
+				const sha = await snapshotDirtyTree(repo);
+				expect(sha).toMatch(/^[0-9a-f]{40}$/);
+				expect((await git(["status", "--porcelain"], repo)).stdout).toBe(before);
+				expect((await git(["show", `${sha}:README.md`], repo)).stdout).toBe("# changed\n");
+				expect((await git(["show", `${sha}:new.txt`], repo)).stdout).toBe("untracked\n");
+				expect((await git(["rev-parse", `${sha}^`], repo)).stdout.trim()).toBe((await git(["rev-parse", "HEAD"], repo)).stdout.trim());
+			} finally {
+				await rmrf(repo);
+			}
+		},
+		TIMEOUT,
+	);
+
+	it(
+		"carries uncommitted changes into worktrees and merges disjoint tasks back by diff",
+		async () => {
+			const repo = await makeTempRepo();
+			try {
+				await fs.promises.writeFile(path.join(repo, "a.txt"), "a base\n", "utf-8");
+				await fs.promises.writeFile(path.join(repo, "b.txt"), "b base\n", "utf-8");
+				await git(["add", "-A"], repo);
+				await git(["commit", "-m", "add a and b"], repo);
+				await fs.promises.writeFile(path.join(repo, "a.txt"), "a base\na uncommitted\n", "utf-8");
+				await fs.promises.writeFile(path.join(repo, "b.txt"), "b base\nb uncommitted\n", "utf-8");
+				const append = async (cwd: string, file: string, line: string) => {
+					const target = path.join(cwd, file);
+					const current = await fs.promises.readFile(target, "utf-8");
+					expect(current).toContain("uncommitted");
+					await fs.promises.writeFile(target, `${current}${line}\n`, "utf-8");
+					return { exitCode: 0, text: "done", stderr: "", timedOut: false };
+				};
+				const plan: TaskList = {
+					tasks: [makeTask({ id: "task-a", paths: ["a.txt"] }), makeTask({ id: "task-b", paths: ["b.txt"] })],
+				};
+				const { runs, mergeLog } = await runDelegation(plan, [], {
+					cwd: repo,
+					runId: "t-snap",
+					resolveModel: () => undefined,
+					runAgent: async (opts) => (opts.cwd.includes("task-a") ? append(opts.cwd, "a.txt", "a task") : append(opts.cwd, "b.txt", "b task")),
+				});
+				expect(mergeLog.some((l) => l.includes("branch from snapshot"))).toBe(true);
+				expect(runs.every((r) => r.status === "succeeded" && r.merged === true && !!r.base_snapshot)).toBe(true);
+				expect(await fs.promises.readFile(path.join(repo, "a.txt"), "utf-8")).toBe("a base\na uncommitted\na task\n");
+				expect(await fs.promises.readFile(path.join(repo, "b.txt"), "utf-8")).toBe("b base\nb uncommitted\nb task\n");
+				await cleanupWorktrees(runs, repo);
+			} finally {
+				await rmrf(repo);
+			}
+		},
+		TIMEOUT,
+	);
+
+	it(
+		"marks a conflict when a snapshot-based task diff does not apply",
+		async () => {
+			const repo = await makeTempRepo();
+			try {
+				await fs.promises.writeFile(path.join(repo, "shared.txt"), "uncommitted\n", "utf-8");
+				const plan: TaskList = {
+					tasks: [makeTask({ id: "task-a", workspace: "worktree" }), makeTask({ id: "task-b", workspace: "worktree" })],
+					merge_plan: { order: ["task-a", "task-b"], conflict_owner: "coordinator" },
+				};
+				const { runs, mergeLog } = await runDelegation(plan, [], {
+					cwd: repo,
+					runId: "t-snap-conflict",
+					resolveModel: () => undefined,
+					runAgent: async (opts) => {
+						const who = opts.cwd.includes("task-a") ? "a" : "b";
+						await fs.promises.writeFile(path.join(opts.cwd, "shared.txt"), `changed by ${who}\n`, "utf-8");
+						return { exitCode: 0, text: "done", stderr: "", timedOut: false };
+					},
+				});
+				const runA = runs.find((r) => r.task_id === "task-a");
+				const runB = runs.find((r) => r.task_id === "task-b");
+				expect(runA?.merged).toBe(true);
+				expect(runB?.conflict).toBe(true);
+				expect(runB?.merged).toBeFalsy();
+				expect(mergeLog.some((l) => l.includes("patch kept at"))).toBe(true);
+				expect(await fs.promises.readFile(path.join(repo, "shared.txt"), "utf-8")).toBe("changed by a\n");
 				await cleanupWorktrees(runs, repo);
 			} finally {
 				await rmrf(repo);

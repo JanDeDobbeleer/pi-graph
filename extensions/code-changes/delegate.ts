@@ -9,9 +9,15 @@
  * `examples/extensions/subagent/index.ts` in `@earendil-works/pi-coding-agent`. It is copied and
  * trimmed down here rather than imported, since the example is not a published module.
  *
- * Worktree merge strategy: a later-wave worktree task always branches from `HEAD` (not from an
- * earlier wave's branch), so if it depends on an earlier-wave worktree task, its own worktree
- * would not otherwise see that task's changes. We fix this up right after creating the worktree,
+ * Uncommitted changes: when the main tree is dirty, a snapshot commit of the whole working tree
+ * (tracked changes plus untracked files) is built without touching the real index or working
+ * tree, and worktrees branch from it, so tasks see the uncommitted work and can run in parallel.
+ * Because the main tree already contains that content, worktree branches are then merged back by
+ * applying each task's own diff (snapshot..branch) instead of `git merge --squash`.
+ *
+ * Worktree merge strategy: a later-wave worktree task always branches from the start commit (`HEAD`
+ * or the snapshot, not from an earlier wave's branch), so if it depends on an earlier-wave worktree
+ * task, its own worktree would not otherwise see that task's changes. We fix this up right after creating the worktree,
  * by running `git merge --no-edit <depBranch>` inside it for every succeeded worktree dependency.
  * Main-tree tasks that depend on a worktree task do NOT get this treatment: the worktree branch
  * only lands in the main tree during the final merge step, after every wave has run. Sequencing a
@@ -361,16 +367,96 @@ export async function mainTreeChangesSince(cwd: string, before: MainTreeSnapshot
 
 /**
  * The commit a worktree's own work started from: the latest dependency-merge commit on its branch
- * (changes brought in by earlier tasks are not this task's), else the fork point from the main tree's HEAD.
+ * (changes brought in by earlier tasks are not this task's), else the fork point from the main tree's HEAD
+ * (or from `snapshot`, the commit of uncommitted changes the worktree branched from, when given).
  */
-export async function deriveWorktreeBase(worktree: string, mainCwd: string, signal?: AbortSignal): Promise<string | undefined> {
-	const mainHead = await git(["rev-parse", "HEAD"], mainCwd, signal);
-	if (mainHead.code !== 0) return undefined;
-	const head = mainHead.stdout.trim();
+export async function deriveWorktreeBase(
+	worktree: string,
+	mainCwd: string,
+	signal?: AbortSignal,
+	snapshot?: string,
+): Promise<string | undefined> {
+	let head = snapshot;
+	if (!head) {
+		const mainHead = await git(["rev-parse", "HEAD"], mainCwd, signal);
+		if (mainHead.code !== 0) return undefined;
+		head = mainHead.stdout.trim();
+	}
 	const merges = await git(["rev-list", "--merges", "-n", "1", "HEAD", `^${head}`], worktree, signal);
 	if (merges.code === 0 && merges.stdout.trim()) return merges.stdout.trim();
 	const forkPoint = await git(["merge-base", "HEAD", head], worktree, signal);
 	return forkPoint.code === 0 && forkPoint.stdout.trim() ? forkPoint.stdout.trim() : undefined;
+}
+
+/**
+ * Commits the main tree's full working state (tracked changes plus untracked, non-ignored files)
+ * without touching the real index or working tree: a temporary index is filled from HEAD, `add -A`
+ * picks up the working tree, and the resulting tree becomes a commit on top of HEAD. Returns the
+ * commit sha, or undefined when the tree is clean or the snapshot could not be built. The commit is
+ * unreferenced, so `git gc` eventually reclaims it.
+ */
+export async function snapshotDirtyTree(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
+	const status = await git(["status", "--porcelain"], cwd, signal);
+	if (status.code !== 0 || status.stdout.trim() === "") return undefined;
+	const indexFile = path.join(os.tmpdir(), `pi-cc-snapshot-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.index`);
+	const env = { GIT_INDEX_FILE: indexFile };
+	try {
+		if ((await git(["read-tree", "HEAD"], cwd, signal, env)).code !== 0) return undefined;
+		if ((await git(["add", "-A"], cwd, signal, env)).code !== 0) return undefined;
+		const tree = await git(["write-tree"], cwd, signal, env);
+		if (tree.code !== 0 || !tree.stdout.trim()) return undefined;
+		const commit = await git(
+			[
+				"-c",
+				"user.name=pi-cc",
+				"-c",
+				"user.email=pi-cc@localhost",
+				"commit-tree",
+				tree.stdout.trim(),
+				"-p",
+				"HEAD",
+				"-m",
+				"pi-cc snapshot of uncommitted changes",
+			],
+			cwd,
+			signal,
+			env,
+		);
+		return commit.code === 0 && commit.stdout.trim() ? commit.stdout.trim() : undefined;
+	} finally {
+		try {
+			await fs.promises.unlink(indexFile);
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
+/**
+ * Lands a worktree branch on the main tree when the worktree started from a snapshot of the main
+ * tree's uncommitted changes: applies the task's own diff (snapshot..branch) to the working tree
+ * only. On failure the patch file is kept and its path returned so the coordinator can inspect it.
+ */
+export async function applySnapshotDiff(
+	cwd: string,
+	snapshot: string,
+	branch: string,
+	label: string,
+	signal?: AbortSignal,
+): Promise<{ ok: true } | { ok: false; patchFile: string; error: string }> {
+	const diff = await git(["diff", "--binary", snapshot, branch], cwd, signal);
+	const patchFile = path.join(os.tmpdir(), `pi-cc-merge-${sanitizeTaskId(label)}-${Date.now()}.patch`);
+	if (diff.code !== 0) return { ok: false, patchFile, error: `git diff failed: ${tail(diff.stderr || diff.stdout)}` };
+	if (diff.stdout.trim() === "") return { ok: true };
+	await fs.promises.writeFile(patchFile, diff.stdout, "utf-8");
+	const applyResult = await git(["apply", "--whitespace=nowarn", patchFile], cwd, signal);
+	if (applyResult.code !== 0) return { ok: false, patchFile, error: tail(applyResult.stderr || applyResult.stdout) };
+	try {
+		await fs.promises.unlink(patchFile);
+	} catch {
+		/* ignore */
+	}
+	return { ok: true };
 }
 
 /** The changed files that fall outside `task.paths` (none when the task declares no paths). */
@@ -459,6 +545,7 @@ async function runWorktreeTask(
 	decisions: Map<string, WorkspaceDecision>,
 	allRuns: TaskRun[],
 	notify: () => void,
+	snapshot?: string,
 ): Promise<void> {
 	run.status = "running";
 	notify();
@@ -468,7 +555,7 @@ async function runWorktreeTask(
 	const worktreePath = path.join(os.tmpdir(), "pi-cc", `${deps.runId}-${sanitized}`);
 
 	await fs.promises.mkdir(path.dirname(worktreePath), { recursive: true });
-	const addResult = await serializeWorktreeAdd(() => git(["worktree", "add", "-b", branch, worktreePath, "HEAD"], deps.cwd, deps.signal));
+	const addResult = await serializeWorktreeAdd(() => git(["worktree", "add", "-b", branch, worktreePath, snapshot ?? "HEAD"], deps.cwd, deps.signal));
 	if (addResult.code !== 0) {
 		run.status = "failed";
 		run.error = `git worktree add failed: ${tail(addResult.stderr || addResult.stdout)}`;
@@ -477,8 +564,9 @@ async function runWorktreeTask(
 	}
 	run.worktree = worktreePath;
 	run.branch = branch;
+	run.base_snapshot = snapshot;
 
-	// Pull in any earlier-wave worktree dependency's changes: this worktree branched from HEAD
+	// Pull in any earlier-wave worktree dependency's changes: this worktree branched from the start commit
 	// and never saw them otherwise (see module doc comment).
 	for (const depId of task.dependencies) {
 		const depTask = plan.tasks.find((t) => t.id === depId);
@@ -604,21 +692,22 @@ export async function runDelegation(
 
 	const statusResult = await git(["status", "--porcelain"], deps.cwd, deps.signal);
 	const dirty = statusResult.stdout.trim() !== "";
+	let snapshot: string | undefined;
 	if (dirty) {
-		mergeLog.push("main tree has uncommitted changes; worktrees branch from HEAD");
+		snapshot = await snapshotDirtyTree(deps.cwd, deps.signal);
+		mergeLog.push(
+			snapshot
+				? `main tree has uncommitted changes; worktrees branch from snapshot ${snapshot.slice(0, 8)} so they see them`
+				: "main tree has uncommitted changes, but a snapshot could not be built; worktrees branch from HEAD and will not see them",
+		);
 	}
 
-	let movedAny = false;
 	for (const t of plan.tasks) {
 		const decision = decisions.get(t.id);
 		const run = allRuns.find((r) => r.task_id === t.id);
 		if (!decision?.auto || !run) continue;
 		run.auto_worktree = true;
-		movedAny = true;
 		mergeLog.push(`task ${t.id} moved to a worktree ${decision.reason}`);
-	}
-	if (dirty && movedAny) {
-		mergeLog.push("moved tasks will not see the uncommitted changes above; set requires_main_tree on a task that needs them");
 	}
 
 	for (const wave of waves) {
@@ -641,7 +730,7 @@ export async function runDelegation(
 				const packet = packets.find((p) => p.task_id === t.id);
 				const release = await slots.acquire();
 				try {
-					await runWorktreeTask(t, packet, run, deps, plan, decisions, allRuns, notify);
+					await runWorktreeTask(t, packet, run, deps, plan, decisions, allRuns, notify, snapshot);
 				} finally {
 					release();
 				}
@@ -681,6 +770,19 @@ export async function runDelegation(
 		if (!run || run.status !== "succeeded" || !run.branch) continue;
 		if (stopMerging) {
 			unmergedRemaining.push(taskId);
+			continue;
+		}
+		if (snapshot) {
+			// The main tree already holds the snapshot's content: apply only this task's own diff.
+			const applied = await applySnapshotDiff(deps.cwd, snapshot, run.branch, taskId, deps.signal);
+			if (!applied.ok) {
+				run.conflict = true;
+				mergeLog.push(`conflict applying ${run.branch} (${taskId}) to the main tree: ${applied.error}; patch kept at ${applied.patchFile}`);
+				stopMerging = true;
+				continue;
+			}
+			run.merged = true;
+			mergeLog.push(`merged ${run.branch} (${taskId})`);
 			continue;
 		}
 		const mergeResult = await git(["merge", "--squash", run.branch], deps.cwd, deps.signal);

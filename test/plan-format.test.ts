@@ -120,6 +120,18 @@ describe("formatPlan Execution section", () => {
 		expect(exec).toContain("wave 1: a, b stay in the main tree and run one after another");
 	});
 
+	it("suggests dropping requires_main_tree when pinned tasks have disjoint paths", () => {
+		const plan: TaskList = {
+			tasks: [task({ id: "a", paths: ["a/"], requires_main_tree: true }), task({ id: "b", paths: ["b/"], requires_main_tree: true })],
+		};
+		const exec = section(formatPlan(plan));
+		expect(exec).toContain("drop requires_main_tree to run them in parallel");
+		const overlapping: TaskList = {
+			tasks: [task({ id: "a", paths: ["a/"], requires_main_tree: true }), task({ id: "b", paths: ["a/x"], dependencies: ["a"], requires_main_tree: true })],
+		};
+		expect(section(formatPlan(overlapping))).not.toContain("drop requires_main_tree");
+	});
+
 	it("combines parallel with after-suffix and escapes pipes in cells", () => {
 		const plan: TaskList = {
 			tasks: [

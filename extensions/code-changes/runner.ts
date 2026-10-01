@@ -162,14 +162,14 @@ export interface GitResult {
 	stderr: string;
 }
 
-/** Spawns `git <args>` without a shell. Never throws on non-zero exit or spawn error. */
-export async function git(args: string[], cwd: string, signal?: AbortSignal): Promise<GitResult> {
+/** Spawns `git <args>` without a shell (optionally with extra env vars). Never throws on non-zero exit or spawn error. */
+export async function git(args: string[], cwd: string, signal?: AbortSignal, env?: Record<string, string>): Promise<GitResult> {
 	return new Promise<GitResult>((resolve) => {
 		let stdout = "";
 		let stderr = "";
 		let proc: ReturnType<typeof spawn>;
 		try {
-			proc = spawn("git", args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+			proc = spawn("git", args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"], ...(env ? { env: { ...process.env, ...env } } : {}) });
 		} catch (err) {
 			resolve({ code: 127, stdout: "", stderr: err instanceof Error ? err.message : String(err) });
 			return;

@@ -15,6 +15,7 @@ import * as path from "node:path";
 import { Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
+	applySnapshotDiff,
 	changedFilesSince,
 	commitWorktree,
 	DEFAULT_TASK_TIMEOUT_MS,
@@ -198,7 +199,7 @@ export function createResumeTaskTool(deps: ResumeDeps): ToolDefinition<typeof Re
 			// available; for the main tree only this resume's changes are, so earlier violations that are
 			// still dirty are kept.
 			if (isWorktree) {
-				const base = await deriveWorktreeBase(workDir, ctx.cwd, signal);
+				const base = await deriveWorktreeBase(workDir, ctx.cwd, signal, run.base_snapshot);
 				const files = base ? await changedFilesSince(workDir, base, signal) : [];
 				recordScope(updatedRun, base ? outOfScopeFiles(files, task) : (run.out_of_scope ?? []));
 			} else if (mainBefore) {
@@ -259,16 +260,27 @@ export function createResumeTaskTool(deps: ResumeDeps): ToolDefinition<typeof Re
 					} else if (run.branch) {
 						// Not merged yet (e.g. the initial run failed before merge): squash-merge like
 						// runDelegation's own merge step.
-						const mergeResult = await git(["merge", "--squash", run.branch], ctx.cwd, signal);
-						if (mergeResult.code !== 0) {
-							updatedRun.conflict = true;
-							const conflictFiles = await git(["diff", "--name-only", "--diff-filter=U"], ctx.cwd, signal);
-							mergeNote = `Merge conflict merging ${run.branch}: ${mergeResult.stderr || mergeResult.stdout}. Conflicted files: ${
-								conflictFiles.stdout.trim() || "(none reported)"
-							}`;
+						if (run.base_snapshot) {
+							const applied = await applySnapshotDiff(ctx.cwd, run.base_snapshot, run.branch, params.task_id, signal);
+							if (applied.ok) {
+								updatedRun.merged = true;
+								mergeNote = `Merged ${run.branch} into the main tree.`;
+							} else {
+								updatedRun.conflict = true;
+								mergeNote = `Applying ${run.branch} to the main tree failed: ${applied.error}. Patch kept at ${applied.patchFile}`;
+							}
 						} else {
-							updatedRun.merged = true;
-							mergeNote = `Merged ${run.branch} into the main tree.`;
+							const mergeResult = await git(["merge", "--squash", run.branch], ctx.cwd, signal);
+							if (mergeResult.code !== 0) {
+								updatedRun.conflict = true;
+								const conflictFiles = await git(["diff", "--name-only", "--diff-filter=U"], ctx.cwd, signal);
+								mergeNote = `Merge conflict merging ${run.branch}: ${mergeResult.stderr || mergeResult.stdout}. Conflicted files: ${
+									conflictFiles.stdout.trim() || "(none reported)"
+								}`;
+							} else {
+								updatedRun.merged = true;
+								mergeNote = `Merged ${run.branch} into the main tree.`;
+							}
 						}
 					}
 				}

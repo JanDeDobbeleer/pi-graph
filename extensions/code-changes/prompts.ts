@@ -194,7 +194,7 @@ const READ_ONLY_SHELL_LINE =
 	"In this phase bash/powershell are limited to an allowlist of inspection commands; do not run interpreters or scripts (node -e, python, npm run, loops) — read files with read/grep/find instead. Execution happens in Delegate/Verify.";
 
 const PLAN_PARALLELISM_LINE =
-	"Split work by folder: give every sub-agent task `paths` (the folders/files/globs it may change). Independent tasks with non-overlapping paths run in parallel in separate worktrees automatically; overlapping independent tasks are rejected — add a dependency or merge them. Set requires_main_tree only when the task needs uncommitted local changes.";
+	"Split work by folder: give every sub-agent task `paths` (the folders/files/globs it may change). Whenever there are 2+ independent groups of files/folders, make them separate sub-agent tasks with non-overlapping paths rather than one big coordinator-direct task: they run in parallel in separate worktrees automatically; overlapping independent tasks are rejected — add a dependency or merge them. Uncommitted changes in the main tree are carried into worktrees automatically, so they are not a reason to avoid worktrees. Set requires_main_tree only when a task truly must run in the main tree (e.g. it needs local services or state that is not in git); pinned tasks run one after another.";
 
 function gateShellPhrase(): string {
 	const label = knownGateShellLabel();

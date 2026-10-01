@@ -6,7 +6,9 @@
  * "main" is moved into a worktree by the harness (`auto`) when that lets it run in parallel:
  *   - it has an independent sub-agent task in the same wave with non-overlapping paths, or
  *   - it depends on a task that was itself moved, so it can merge that task's branch in.
- * Tasks flagged `requires_main_tree` (and anything they transitively depend on) stay in the main tree.
+ * Tasks flagged `requires_main_tree` (and anything they transitively depend on) stay in the main tree;
+ * that is for tasks that truly need it (local services/state not in git), not for uncommitted file
+ * changes: delegate.ts carries those into worktrees via a snapshot commit.
  */
 
 import { independent, pathsOverlap } from "./paths.ts";

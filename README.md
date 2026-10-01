@@ -464,9 +464,13 @@ The harness, not the model, decides which tasks run in parallel.
   it, so its worktree can merge those branches in; a task that (transitively) feeds a
   `requires_main_tree` task stays in the main tree. Moved runs have `TaskRun.auto_worktree = true`
   and a line in the merge log (`task X moved to a worktree to run in parallel with Y`). The plan
-  approval view leads with an **Execution** overview: per wave a table of task, tier and model, workspace and paths (parallel or sequential, which tasks moved), heads-ups (model fallbacks, uncommitted main-tree changes), then merge order, gates and delivery.
-- **`requires_main_tree`**: set it only when a task needs the uncommitted changes in the main tree;
-  worktrees branch from `HEAD` and do not see them. It is never moved.
+  approval view leads with an **Execution** overview: per wave a table of task, tier and model, workspace and paths (parallel or sequential, which tasks moved), heads-ups (model fallbacks, uncommitted main-tree changes, pinned tasks that could run in parallel), then merge order, gates and delivery.
+- **`requires_main_tree`**: set it only when a task truly must run in the main tree (for example it
+  needs local services or state that is not in git). Uncommitted changes are not a reason: when the
+  main tree is dirty, Delegate builds a snapshot commit of the working tree (tracked changes plus
+  untracked files, without touching the real index or working tree) and worktrees branch from it.
+  A pinned task is never moved and runs one after another with the other main-tree tasks; the plan
+  heads-up suggests dropping it when its paths do not overlap with the others.
 - **`merge_plan`** is optional. Since the harness decides the final workspaces, when it is omitted the
   worktree branches are merged in plan order. When present, `merge_plan.order` must list exactly the
   tasks that end up in worktrees (computed with the same `effectiveWorkspace`), and `conflict_owner`
@@ -483,14 +487,17 @@ The harness, not the model, decides which tasks run in parallel.
 
 ## Delegation details
 
-- Each worktree task gets its own `git worktree add -b pi-cc/<run-id>/<task-id> <path> HEAD`, in the
-  OS temp dir.
+- Each worktree task gets its own `git worktree add -b pi-cc/<run-id>/<task-id> <path> <start>`, in the
+  OS temp dir, where `<start>` is `HEAD`, or the snapshot commit of the main tree's uncommitted changes when it is dirty.
 - Tasks run wave-by-wave by dependency order: worktree tasks in a wave run in parallel (up to
   `maxParallel`), main-tree tasks in a wave run sequentially in the main working tree.
 - Each dispatched task runs in a fresh, session-less child `pi` process (`--no-extensions
   --no-session --mode json`), so it never re-loads this extension or any other project extension.
 - After every wave, successful worktree branches are squash-merged back into the main tree in
   `merge_plan.order` (or plan order), stopping at the first conflict so Supervise can resolve it.
+  When the worktrees started from a snapshot of uncommitted changes, each branch's own diff
+  (`git diff --binary <snapshot> <branch>`) is applied to the main working tree instead; on failure
+  the patch file is kept and its path logged.
 - Worktrees are removed on `/change abort`, `/change cleanup`, and successful delivery - not
   automatically at any other point, so a failed run can still be inspected.
 

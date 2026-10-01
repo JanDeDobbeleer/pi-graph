@@ -125,6 +125,8 @@ export interface TaskRun {
 	out_of_scope?: string[];
 	/** True when the harness moved a main-tree task into a worktree to run it in parallel. */
 	auto_worktree?: boolean;
+	/** Snapshot commit of the main tree's uncommitted changes this worktree branched from (merged back by diff, not squash). */
+	base_snapshot?: string;
 	/** True when the implementer was killed for exceeding its time budget. */
 	stalled?: boolean;
 	/** True once repeated spec gaps on this task were escalated (escalate.md trigger). */

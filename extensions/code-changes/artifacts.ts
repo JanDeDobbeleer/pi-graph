@@ -90,7 +90,8 @@ const PlanTaskSchema = Type.Object({
 	),
 	requires_main_tree: Type.Optional(
 		Type.Boolean({
-			description: "True when the task needs uncommitted changes in the main tree, so it must not be moved to a worktree.",
+			description:
+				"True only when the task truly must run in the main tree (e.g. it needs local services or state that is not in git). Not needed for uncommitted file changes: those are carried into worktrees. Pinned tasks run one after another.",
 		}),
 	),
 });
@@ -641,7 +642,7 @@ export interface PlanExecutionOptions {
 	maxParallel: number;
 	/** Tiers whose configured model could not be resolved (they run on the session model instead). */
 	fellBack?: ExecutorTier[];
-	/** True when the main tree has uncommitted changes (worktrees branch from HEAD and will not see them). */
+	/** True when the main tree has uncommitted changes (worktrees start from a snapshot of them). */
 	mainTreeDirty?: boolean;
 }
 
@@ -727,7 +728,7 @@ function formatExecution(plan: TaskList, decisions: ReturnType<typeof planWorksp
 		headsUp.push(`the configured model for ${fellBack.map((t) => `\`${t}\``).join(", ")} is unavailable (unknown model, or no API key/login for its provider); the session model is used instead`);
 	}
 	if (exec?.mainTreeDirty && worktreeIds.length > 0) {
-		headsUp.push(`the main tree has uncommitted changes; worktree tasks (${worktreeIds.join(", ")}) branch from HEAD and will not see them`);
+		headsUp.push(`the main tree has uncommitted changes; worktree tasks (${worktreeIds.join(", ")}) start from a snapshot of them, so they see them`);
 	}
 
 	const wavesOut: string[] = [];
@@ -749,7 +750,13 @@ function formatExecution(plan: TaskList, decisions: ReturnType<typeof planWorksp
 		for (const t of wave) earlier.add(t.id);
 
 		if (waveMain.length > 1) {
-			headsUp.push(`wave ${index + 1}: ${waveMain.map((t) => t.id).join(", ")} stay in the main tree and run one after another`);
+			const pinned = waveMain.filter((t) => t.requires_main_tree === true && (decisions.get(t.id)?.parallelWith.length ?? 0) > 0);
+			headsUp.push(
+				`wave ${index + 1}: ${waveMain.map((t) => t.id).join(", ")} stay in the main tree and run one after another` +
+					(pinned.length > 0
+						? `; ${pinned.map((t) => t.id).join(", ")} ${pinned.length > 1 ? "have" : "has"} paths that do not overlap with the other tasks and ${pinned.length > 1 ? "are" : "is"} pinned only via requires_main_tree — drop requires_main_tree to run them in parallel (uncommitted changes are carried into worktrees)`
+						: ""),
+			);
 		}
 
 		wavesOut.push("");
@@ -825,7 +832,7 @@ const PLAN_EDIT_COMMENT = [
 	'  - tasks[].workspace: "main" | "worktree"',
 	"  - tasks[].dependencies: ids of other tasks in this plan that must land first, if any",
 	'  - tasks[].paths: repo-relative folders, files or globs the task may change (required for sub-agent tasks; independent tasks must not overlap)',
-	"  - tasks[].requires_main_tree: optional; true keeps the task in the main tree (needs uncommitted local changes)",
+	"  - tasks[].requires_main_tree: optional; true keeps the task in the main tree, one after another (only when it truly needs the main tree, e.g. local services; uncommitted file changes are carried into worktrees, so they are not a reason)",
 	"  - merge_plan (optional; when given it must list exactly the tasks that run in worktrees, otherwise plan order is used):",
 	"      order: task ids in the order their worktrees should be merged",
 	"      conflict_owner: who resolves a merge conflict between worktree tasks",
