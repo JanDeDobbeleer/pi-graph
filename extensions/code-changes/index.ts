@@ -78,6 +78,7 @@ import {
 import { decideToolCall, READ_ONLY_PHASES, toolsForPhase, WORKFLOW_TOOLS } from "./gates.ts";
 import { discoverStopHooks, findRepoRoot, formatHookFeedback, hooksBlocked, runStopHooks, StopHookGuard, type StopHook } from "./hooks.ts";
 import { delegateModelRef, loadGateAdvisorRaw, loadGateLogPath, loadMaxParallel, loadReadOnlyTools, loadTierConfig, modelRef, resolveTierModel, tierForExecutor } from "./models.ts";
+import { formatRunLabel } from "./names.ts";
 import { phasePrompt, phaseReminder } from "./prompts.ts";
 import { createResumeTaskTool, escalateSpecGaps, needsSpecGapEscalation, type ResumeDeps } from "./resume.ts";
 import { isTransientProviderError, MAX_TRANSIENT_RETRIES, retryBackoff } from "./retry.ts";
@@ -118,6 +119,8 @@ interface PendingAmendment extends GateAmendmentRequest {
 interface PhasePromptDetails {
 	phase: Phase;
 	runId: string;
+	/** Readable label component; absent on phase prompts persisted by older versions. */
+	slug?: string;
 	/** True when the prompt carries extra context (revise feedback, CI failure, failure record). */
 	extra: boolean;
 }
@@ -182,7 +185,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		if (options.expanded) return new Markdown(text, 1, 0, getMarkdownTheme());
 		const details = message.details;
 		const phase = details ? PHASE_LABEL[details.phase] : "phase";
-		const run = details ? ` (run ${details.runId})` : "";
+		const run = details ? ` (run ${formatRunLabel({ id: details.runId, slug: details.slug })})` : "";
 		const extra = details?.extra ? " · with feedback" : "";
 		return new Text(theme.fg("muted", `code-changes · ${phase} phase${run}${extra} · expand to read the instructions`), 1, 0);
 	});
@@ -402,7 +405,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 				{ customType: "code-changes-phase", content: `[code-changes] ${PHASE_LABEL[state.phase]}\n\n${report}`, display: true },
 				{ triggerTurn: false },
 			);
-			ctx.ui.notify(`code-changes: run ${state.id} ${state.phase}.`, state.phase === "done" ? "info" : "warning");
+			ctx.ui.notify(`code-changes: run ${formatRunLabel(state)} ${state.phase}.`, state.phase === "done" ? "info" : "warning");
 			return;
 		}
 
@@ -419,7 +422,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		await resolveGateShell(ctx.cwd); // so the Plan/Verify prompts can name the gate shell
 		state = { ...current, phasePromptSent: true };
 		persist();
-		const details: PhasePromptDetails = { phase: current.phase, runId: current.id, extra: extra !== undefined && extra.trim() !== "" };
+		const details: PhasePromptDetails = { phase: current.phase, runId: current.id, slug: current.slug, extra: extra !== undefined && extra.trim() !== "" };
 		const prompt = phasePrompt(current, extra);
 		const content = images?.length ? [{ type: "text" as const, text: prompt }, ...images] : prompt;
 		return { customType: PHASE_PROMPT_MESSAGE, content, display: true, details };
@@ -894,7 +897,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 					return;
 				}
 				ctx.ui.notify(
-					`code-changes: run ${state.id} — task "${state.task}" — phase ${PHASE_LABEL[state.phase]} — failures ${state.failures.length}.` +
+					`code-changes: run ${formatRunLabel(state)} — task "${state.task}" — phase ${PHASE_LABEL[state.phase]} — failures ${state.failures.length}.` +
 						(state.phase === "stopped" && state.stoppedFrom ? ` Stopped — /change resume to reopen ${PHASE_LABEL[state.stoppedFrom]}.` : "") +
 						(pendingAmendment ? ` A gate amendment awaits your decision: /change amend-gate approve|reject.` : ""),
 					"info",

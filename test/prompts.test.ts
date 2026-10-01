@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
+import { formatRunLabel } from "../extensions/code-changes/names.ts";
 import { ANALYSIS_KINDS, newState, type AnalysisKind, type WorkflowState } from "../extensions/code-changes/state.ts";
 import { phasePrompt, phaseReminder, readReference, referencesForPhase, selectKindSections, SKILL_DIR, stripEnforced } from "../extensions/code-changes/prompts.ts";
 
@@ -213,7 +214,7 @@ describe("phasePrompt", () => {
 	it("includes the phase header, task, references, state summary, tools, and exit instruction", () => {
 		const state = stateInPhase("analyze");
 		const text = phasePrompt(state);
-		expect(text).toContain(`[code-changes] Phase: Analyze (run ${state.id})`);
+		expect(text).toContain(`[code-changes] Phase: Analyze (run ${formatRunLabel(state)})`);
 		expect(text).toContain(state.task);
 		expect(text).toContain("Reference: analyze.md");
 		expect(text).toContain("Reference: escalate.md");
@@ -221,6 +222,13 @@ describe("phasePrompt", () => {
 		expect(text).toContain("submit_analysis");
 		expect(text).toContain("This phase ends only when you call `submit_analysis`.");
 		expect(text).toContain("Edit and write are blocked");
+	});
+
+	it("uses a readable run label and preserves the raw ID for legacy state", () => {
+		const current = stateInPhase("analyze", { id: "muprn2y8", slug: "friendlier-run-slugs" });
+		expect(phasePrompt(current)).toContain("(run friendlier-run-slugs · n2y8)");
+		const legacy = stateInPhase("analyze", { id: "legacy-full-id", slug: undefined });
+		expect(phasePrompt(legacy)).toContain("(run legacy-full-id)");
 	});
 
 	it("no longer injects artifacts.md", () => {
@@ -329,12 +337,18 @@ describe("phasePrompt", () => {
 });
 
 describe("phaseReminder", () => {
-	it("is short and mentions phase, tools, and the exit tool", () => {
-		const state = stateInPhase("plan");
+	it("is short and mentions the readable run label, phase, tools, and exit tool", () => {
+		const state = stateInPhase("plan", { id: "muprn2y8", slug: "friendlier-run-slugs" });
 		const text = phaseReminder(state);
 		expect(text.split("\n").length).toBeLessThanOrEqual(6);
+		expect(text).toContain("Run friendlier-run-slugs · n2y8");
 		expect(text).toContain("Plan");
 		expect(text).toContain("submit_plan");
+	});
+
+	it("shows the complete raw ID for a legacy state", () => {
+		const text = phaseReminder(stateInPhase("plan", { id: "legacy-full-id", slug: undefined }));
+		expect(text).toContain("Run legacy-full-id");
 	});
 
 	it("points at the human gate while awaiting approval", () => {

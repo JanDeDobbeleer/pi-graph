@@ -7,6 +7,7 @@
  */
 
 import type { GateAdvice, GateHistoryItem, GateKind } from "./gatelog.ts";
+import { generateRunSlug } from "./names.ts";
 
 export const STATE_ENTRY = "code-changes-state";
 
@@ -242,6 +243,8 @@ export interface Delivery {
 
 export interface WorkflowState {
 	id: string;
+	/** Readable task-derived label component; absent on states restored from older sessions. */
+	slug?: string;
 	task: string;
 	phase: Phase;
 	/** `git rev-parse HEAD` when the run started; undefined outside a git repo. */
@@ -303,8 +306,10 @@ export interface NewStateOptions {
 }
 
 export function newState(task: string, baselineTools: string[], baseRef: string | undefined, opts: NewStateOptions = {}): WorkflowState {
+	const id = Date.now().toString(36);
 	return {
-		id: Date.now().toString(36),
+		id,
+		slug: generateRunSlug(task, id),
 		task,
 		phase: "analyze",
 		baseRef,

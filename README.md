@@ -84,6 +84,12 @@ remains available when you want flags or a specialized entry point:
                                  with `amend_gate` when there is no UI to confirm in)
 ```
 
+Each new run also gets a readable task-derived label, shown in prompts, notifications, collapsed
+phase headers, and `/change status` (for example `friendlier-run-slugs · n2y8`). The suffix is a
+short correlation to the unchanged timestamp ID used internally for branches, paths, resumes, and
+logs. Runs restored from older sessions have no stored slug and continue to display their complete
+raw ID.
+
 Analyze works for any request, not only bugs. The model first classifies it as one of six kinds
 and reports accordingly:
 

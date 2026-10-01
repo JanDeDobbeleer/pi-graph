@@ -253,8 +253,15 @@ describe("code-changes e2e (real pi runtime, scripted fake model)", () => {
 					.filter((e: any) => e.type === "custom" && e.customType === "code-changes-state");
 				const last = (states[states.length - 1] as any).data;
 				expect(last.task).toBe("fix the greeting");
+				expect(last.id).toMatch(/^[a-z0-9]+$/);
+				expect(last.slug).toBe("greeting");
+				expect(last.id).not.toBe(last.slug);
 				expect(last.phase).toBe("awaiting_approval");
 				expect(last.analysis.findings).toContain("Hello instead of Hi");
+				const phaseEntry = session.messages.find((m) => (m as any).customType === "code-changes-phase-prompt") as any;
+				expect(phaseEntry?.details).toMatchObject({ runId: last.id, slug: "greeting", phase: "analyze" });
+				const phaseText = typeof phaseEntry?.content === "string" ? phaseEntry.content : (phaseEntry?.content ?? []).map((c: any) => c.text ?? "").join(" ");
+				expect(phaseText).toContain(`run greeting · ${last.id.slice(-4)}`);
 				expect(session.messages.some((m) => m.role === "user" && (m as any).content === "fix the greeting")).toBe(false);
 			} finally {
 				session.dispose();
@@ -746,7 +753,10 @@ describe("code-changes e2e (real pi runtime, scripted fake model)", () => {
 				gateLog: logFile,
 				gateAdvisor: { provider: "jev", endpoint: `http://127.0.0.1:${port}/v1/systemone`, apiKeyEnv: "PI_CC_E2E_JEV_KEY" },
 			});
+			const previousHome = process.env.HOME;
+			const previousUserProfile = process.env.USERPROFILE;
 			process.env.HOME = home;
+			process.env.USERPROFILE = home;
 			process.env.PI_CC_E2E_JEV_KEY = "test-key";
 
 			const { extension: fakeProvider, model, queue } = makeFakeProvider();
@@ -813,6 +823,10 @@ describe("code-changes e2e (real pi runtime, scripted fake model)", () => {
 				session.dispose();
 				server.close();
 				delete process.env.PI_CC_E2E_JEV_KEY;
+				if (previousHome === undefined) delete process.env.HOME;
+				else process.env.HOME = previousHome;
+				if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+				else process.env.USERPROFILE = previousUserProfile;
 			}
 		},
 		TIMEOUT,

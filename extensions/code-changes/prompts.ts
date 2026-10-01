@@ -21,6 +21,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatGateAmendments, requiredGateCommands, summarizeState } from "./artifacts.ts";
 import { PHASE_ARTIFACT_TOOL, PHASE_TOOLS } from "./gates.ts";
+import { formatRunLabel } from "./names.ts";
 import { knownGateShellLabel } from "./shell.ts";
 import { PHASE_LABEL, type AnalysisKind, type Phase, type WorkflowState } from "./state.ts";
 
@@ -317,7 +318,7 @@ function phaseExtra(state: WorkflowState): string | undefined {
 /** The full instruction sent on entering a model-driven phase. */
 export function phasePrompt(state: WorkflowState, extra?: string): string {
 	const lines: string[] = [];
-	lines.push(`[code-changes] Phase: ${PHASE_LABEL[state.phase]} (run ${state.id})`);
+	lines.push(`[code-changes] Phase: ${PHASE_LABEL[state.phase]} (run ${formatRunLabel(state)})`);
 	lines.push("");
 	lines.push(`## Task\n${state.task}`);
 	lines.push("");
@@ -372,7 +373,7 @@ export function phasePrompt(state: WorkflowState, extra?: string): string {
 /** Short reminder injected on every user prompt while a run is active. */
 export function phaseReminder(state: WorkflowState): string {
 	const lines: string[] = [];
-	lines.push(`[code-changes] Run ${state.id} — phase: ${PHASE_LABEL[state.phase]}.`);
+	lines.push(`[code-changes] Run ${formatRunLabel(state)} — phase: ${PHASE_LABEL[state.phase]}.`);
 	lines.push(`Task: ${state.task}`);
 	lines.push(`Allowed tools: ${toolsLine(state.phase)}`);
 	if (state.phase === "deliver") {
