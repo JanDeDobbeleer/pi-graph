@@ -41,8 +41,19 @@ pi -e ./extensions/code-changes/index.ts
 
 ## Usage
 
+Loading the extension makes the harness the default process. When no run is active, any ordinary
+prompt starts a `/change` run automatically, including a prompt supplied when Pi starts:
+
+```sh
+pi "fix the login bug"
 ```
-/change <task>                 start a run (Analyze first)
+
+Explicit slash commands are left unchanged. While a run is active, ordinary prompts continue that
+run normally; after it finishes or stops, the next ordinary prompt starts a new run. `/change`
+remains available when you want flags or a specialized entry point:
+
+```
+/change <task>                 start a run explicitly (Analyze first)
 /change triage <issue>          start a run at the issue-triage entry — bare "look at/triage issue
                                  #n"; the analysis itself can be the deliverable, ended at the gate
 /change review <pr>             start a run at the pr-review-comments entry — "handle the review

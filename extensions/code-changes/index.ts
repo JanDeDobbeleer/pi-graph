@@ -9,6 +9,7 @@
  */
 
 import { Type } from "typebox";
+import type { ImageContent } from "@earendil-works/pi-ai";
 import { Markdown, Text } from "@earendil-works/pi-tui";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import type {
@@ -383,7 +384,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 	// Phase entry: sends the next model prompt, or wraps up when the run ends.
 	// -------------------------------------------------------------------------
 
-	async function enterPhase(ctx: ExtensionContext, extra?: string): Promise<void> {
+	async function enterPhase(ctx: ExtensionContext, extra?: string, images?: ImageContent[]): Promise<void> {
 		if (!state) return;
 
 		if (state.phase === "done" || state.phase === "stopped") {
@@ -407,19 +408,21 @@ export default function codeChanges(pi: ExtensionAPI): void {
 
 		if (!MODEL_DRIVEN_PHASES.has(state.phase)) return;
 
-		const message = await takePhasePrompt(ctx, extra);
+		const message = await takePhasePrompt(ctx, extra, images);
 		pi.sendMessage(message, { triggerTurn: true, deliverAs: "followUp" });
 	}
 
 	/** Builds the current phase's prompt message and marks it sent. Caller delivers it. */
-	async function takePhasePrompt(ctx: ExtensionContext, extra?: string) {
+	async function takePhasePrompt(ctx: ExtensionContext, extra?: string, images?: ImageContent[]) {
 		const current = state!;
 		await applyCoordinatorModel(ctx);
 		await resolveGateShell(ctx.cwd); // so the Plan/Verify prompts can name the gate shell
 		state = { ...current, phasePromptSent: true };
 		persist();
 		const details: PhasePromptDetails = { phase: current.phase, runId: current.id, extra: extra !== undefined && extra.trim() !== "" };
-		return { customType: PHASE_PROMPT_MESSAGE, content: phasePrompt(current, extra), display: true, details };
+		const prompt = phasePrompt(current, extra);
+		const content = images?.length ? [{ type: "text" as const, text: prompt }, ...images] : prompt;
+		return { customType: PHASE_PROMPT_MESSAGE, content, display: true, details };
 	}
 
 	// -------------------------------------------------------------------------
@@ -830,9 +833,9 @@ export default function codeChanges(pi: ExtensionAPI): void {
 
 	/** Shared by the plain `/change <task>`, `/change triage <issue>` and `/change review <pr>` forms. */
 	async function startRun(
-		ctx: ExtensionCommandContext,
+		ctx: ExtensionContext,
 		task: string,
-		opts: { preApproved: boolean; pushAllowed: boolean; entry?: EntryKind; entryRef?: string },
+		opts: { preApproved: boolean; pushAllowed: boolean; entry?: EntryKind; entryRef?: string; images?: ImageContent[] },
 	): Promise<void> {
 		let previous: WorkflowState | undefined = state;
 		if (isActive(state)) {
@@ -870,7 +873,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		countFrom = 0;
 		if (pendingAmendment) setPendingAmendment(undefined);
 		setState(next, ctx);
-		await enterPhase(ctx);
+		await enterPhase(ctx, undefined, opts.images);
 	}
 
 	pi.registerCommand("change", {
@@ -1628,9 +1631,23 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		return undefined;
 	});
 
-	// CI detection: a PR URL pasted into a user message.
+	// Loading this extension makes the harness the default process: an ordinary prompt received
+	// while no run is active starts /change directly. Extension commands are dispatched before the
+	// input event, so explicit slash commands never reach this branch; preserve unknown slash input
+	// too instead of silently turning it into a task. Extension-injected input is also left alone to
+	// prevent the harness from recursively starting itself.
 	pi.on("input", async (event, ctx): Promise<InputEventResult> => {
+		const task = event.text.trim();
 		const detected = detectPrFromText(event.text);
+		if (!isActive(state) && event.source !== "extension" && task !== "" && !task.startsWith("/")) {
+			await startRun(ctx, task, { preApproved: false, pushAllowed: false, images: event.images });
+			if (detected) {
+				const pr = await resolvePr(ctx.cwd, detected.url);
+				if (pr) await handlePrDetected(pr, ctx);
+			}
+			return { action: "handled" };
+		}
+
 		if (detected) {
 			const pr = await resolvePr(ctx.cwd, detected.url);
 			if (pr) await handlePrDetected(pr, ctx);

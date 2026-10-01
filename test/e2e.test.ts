@@ -225,6 +225,45 @@ async function makeSession(repo: string, extraExtensions: ((pi: ExtensionAPI) =>
 
 describe("code-changes e2e (real pi runtime, scripted fake model)", () => {
 	it(
+		"starts the harness for an ordinary prompt when no run is active",
+		async () => {
+			const repo = await makeTempRepo();
+			cleanupDirs.push(repo);
+			const { extension: fakeProvider, model, queue } = makeFakeProvider();
+			const session = await makeSession(repo, [fakeProvider], model);
+
+			try {
+				queue.push({
+					tool: "submit_analysis",
+					args: {
+						kind: "bug",
+						findings: "greeting.txt says Hello instead of Hi",
+						proposed_change: "change the greeting text to Hi",
+						out_of_scope: "nothing else",
+						evidence: "read greeting.txt",
+						open_questions: [],
+					},
+				});
+
+				await session.prompt("fix the greeting");
+				await session.waitForIdle();
+
+				const states = session.sessionManager
+					.getBranch()
+					.filter((e: any) => e.type === "custom" && e.customType === "code-changes-state");
+				const last = (states[states.length - 1] as any).data;
+				expect(last.task).toBe("fix the greeting");
+				expect(last.phase).toBe("awaiting_approval");
+				expect(last.analysis.findings).toContain("Hello instead of Hi");
+				expect(session.messages.some((m) => m.role === "user" && (m as any).content === "fix the greeting")).toBe(false);
+			} finally {
+				session.dispose();
+			}
+		},
+		TIMEOUT,
+	);
+
+	it(
 		"enforces every gate across the full graph, with no PR to watch",
 		async () => {
 			const repo = await makeTempRepo();
