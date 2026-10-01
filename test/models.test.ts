@@ -12,6 +12,7 @@ import {
 	modelRef,
 	parseModelRef,
 	resolveTierModel,
+	delegateModelRef,
 	tierForExecutor,
 } from "../extensions/code-changes/models.ts";
 
@@ -143,7 +144,13 @@ describe("resolveTierModel", () => {
 			if (provider === "anthropic" && id === "claude-fable-5-1") {
 				return { provider, id } as any;
 			}
+			if (provider === "anthropic" && id === "claude-haiku-4-5") {
+				return { provider, id } as any;
+			}
 			return undefined;
+		},
+		hasConfiguredAuth(model: { id: string }) {
+			return model.id !== "claude-haiku-4-5";
 		},
 	};
 
@@ -166,7 +173,26 @@ describe("resolveTierModel", () => {
 
 	it("falls back to the session model when the configured model is not found", () => {
 		const result = resolveTierModel(fakeRegistry, { escalation: "anthropic/does-not-exist" }, "escalation", sessionModel);
-		expect(result).toEqual({ model: sessionModel, ref: "anthropic/does-not-exist", fellBack: true });
+		expect(result).toEqual({ model: sessionModel, ref: "anthropic/does-not-exist", fellBack: true, reason: "not-found" });
+	});
+
+	it("falls back with reason no-auth when the model exists but has no configured auth", () => {
+		const result = resolveTierModel(fakeRegistry, { trivial: "anthropic/claude-haiku-4-5" }, "trivial", sessionModel);
+		expect(result).toEqual({ model: sessionModel, ref: "anthropic/claude-haiku-4-5", fellBack: true, reason: "no-auth" });
+	});
+
+	describe("delegateModelRef", () => {
+		it("returns the configured ref when it resolves", () => {
+			expect(delegateModelRef(fakeRegistry, { escalation: "anthropic/claude-fable-5-1" }, "escalation", sessionModel)).toBe("anthropic/claude-fable-5-1");
+		});
+
+		it("returns the session ref when the configured model has no auth", () => {
+			expect(delegateModelRef(fakeRegistry, { trivial: "anthropic/claude-haiku-4-5" }, "trivial", sessionModel)).toBe("anthropic/claude-sonnet-5");
+		});
+
+		it("returns undefined when it fell back and there is no session model", () => {
+			expect(delegateModelRef(fakeRegistry, { trivial: "anthropic/claude-haiku-4-5" }, "trivial", undefined)).toBeUndefined();
+		});
 	});
 
 	it("falls back when the ref is malformed", () => {

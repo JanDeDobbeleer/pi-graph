@@ -724,7 +724,7 @@ function formatExecution(plan: TaskList, decisions: ReturnType<typeof planWorksp
 	const headsUp: string[] = [];
 	const fellBack = [...new Set(exec?.fellBack ?? [])];
 	if (fellBack.length > 0) {
-		headsUp.push(`the configured model for ${fellBack.map((t) => `\`${t}\``).join(", ")} could not be resolved; the session model is used instead`);
+		headsUp.push(`the configured model for ${fellBack.map((t) => `\`${t}\``).join(", ")} is unavailable (unknown model, or no API key/login for its provider); the session model is used instead`);
 	}
 	if (exec?.mainTreeDirty && worktreeIds.length > 0) {
 		headsUp.push(`the main tree has uncommitted changes; worktree tasks (${worktreeIds.join(", ")}) branch from HEAD and will not see them`);

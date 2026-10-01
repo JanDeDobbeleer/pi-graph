@@ -146,15 +146,18 @@ export interface ResolvedTierModel {
 	model: Model<any> | undefined;
 	ref: string | undefined;
 	fellBack: boolean;
+	/** Why the lookup fell back; only set when `fellBack` is true. */
+	reason?: "unparseable" | "not-found" | "no-auth";
 }
 
 /**
  * Resolve the configured model for a tier. "session"/undefined falls back to the current
- * session model without treating it as a failed lookup. An unresolvable model reference also
- * falls back, but with `fellBack: true` so callers can warn.
+ * session model without treating it as a failed lookup. An unresolvable model reference, or a
+ * model whose provider has no configured auth, also falls back, but with `fellBack: true` and a
+ * `reason` so callers can warn.
  */
 export function resolveTierModel(
-	registry: Pick<ModelRegistry, "find">,
+	registry: Pick<ModelRegistry, "find" | "hasConfiguredAuth">,
 	config: TierConfig,
 	tier: Tier,
 	fallback: Model<any> | undefined,
@@ -166,15 +169,33 @@ export function resolveTierModel(
 
 	const parsed = parseModelRef(ref);
 	if (!parsed) {
-		return { model: fallback, ref, fellBack: true };
+		return { model: fallback, ref, fellBack: true, reason: "unparseable" };
 	}
 
 	const found = registry.find(parsed.provider, parsed.id);
 	if (!found) {
-		return { model: fallback, ref, fellBack: true };
+		return { model: fallback, ref, fellBack: true, reason: "not-found" };
+	}
+	if (!registry.hasConfiguredAuth(found)) {
+		return { model: fallback, ref, fellBack: true, reason: "no-auth" };
 	}
 
 	return { model: found, ref, fellBack: false };
+}
+
+/**
+ * The model ref a delegated sub-agent should be spawned with: the configured ref when it resolved
+ * and is usable, else the session model's ref, else undefined (the runner's own default).
+ */
+export function delegateModelRef(
+	registry: Pick<ModelRegistry, "find" | "hasConfiguredAuth">,
+	config: TierConfig,
+	tier: Tier,
+	sessionModel: Model<any> | undefined,
+): string | undefined {
+	const resolved = resolveTierModel(registry, config, tier, sessionModel);
+	if (!resolved.fellBack) return resolved.ref;
+	return sessionModel ? modelRef(sessionModel) : undefined;
 }
 
 export function tierForExecutor(t: ExecutorTier): Tier {

@@ -101,7 +101,7 @@ describe("formatPlan Execution section", () => {
 			formatPlan(examplePlan(), { execution: { models: { trivial: "x/missing" }, maxParallel: 4, fellBack: ["trivial"], mainTreeDirty: true } }),
 		);
 		expect(exec).toContain("**Heads-up:**");
-		expect(exec).toContain("could not be resolved");
+		expect(exec).toContain("no API key/login for its provider");
 		expect(exec).toContain("`trivial`");
 		expect(exec).toContain("| docs | trivial → x/missing (fallback) |");
 		expect(exec).toContain("uncommitted changes");

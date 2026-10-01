@@ -76,7 +76,7 @@ import {
 } from "./gatelog.ts";
 import { decideToolCall, READ_ONLY_PHASES, toolsForPhase, WORKFLOW_TOOLS } from "./gates.ts";
 import { discoverStopHooks, findRepoRoot, formatHookFeedback, hooksBlocked, runStopHooks, StopHookGuard, type StopHook } from "./hooks.ts";
-import { loadGateAdvisorRaw, loadGateLogPath, loadMaxParallel, loadReadOnlyTools, loadTierConfig, modelRef, resolveTierModel, tierForExecutor } from "./models.ts";
+import { delegateModelRef, loadGateAdvisorRaw, loadGateLogPath, loadMaxParallel, loadReadOnlyTools, loadTierConfig, modelRef, resolveTierModel, tierForExecutor } from "./models.ts";
 import { phasePrompt, phaseReminder } from "./prompts.ts";
 import { createResumeTaskTool, escalateSpecGaps, needsSpecGapEscalation, type ResumeDeps } from "./resume.ts";
 import { isTransientProviderError, MAX_TRANSIENT_RETRIES, retryBackoff } from "./retry.ts";
@@ -371,7 +371,8 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		const config = loadTierConfig(ctx.cwd);
 		const resolved = resolveTierModel(ctx.modelRegistry, config, "coordinator", ctx.model);
 		if (resolved.fellBack && resolved.ref) {
-			ctx.ui.notify(`code-changes: could not resolve coordinator model "${resolved.ref}"; staying on the current model.`, "warning");
+			const why = resolved.reason === "no-auth" ? "no API key/login for its provider" : "could not be resolved";
+			ctx.ui.notify(`code-changes: coordinator model "${resolved.ref}" ${why}; staying on the current model.`, "warning");
 		}
 		if (resolved.model && (!ctx.model || modelRef(resolved.model) !== modelRef(ctx.model))) {
 			await pi.setModel(resolved.model);
@@ -697,9 +698,14 @@ export default function codeChanges(pi: ExtensionAPI): void {
 		const fellBack: ExecutorTier[] = [];
 		const tiers = new Set<ExecutorTier>(plan.tasks.map((t) => t.executor_tier));
 		for (const tier of tiers) {
-			const resolved = resolveTierModel(ctx.modelRegistry, config, tierForExecutor(tier), undefined);
-			if (resolved.ref !== undefined) models[tier] = resolved.ref;
-			if (resolved.fellBack) fellBack.push(tier);
+			const resolved = resolveTierModel(ctx.modelRegistry, config, tierForExecutor(tier), ctx.model);
+			if (resolved.fellBack) {
+				fellBack.push(tier);
+				// Show the model that will actually run (the session model), not the unusable configured one.
+				if (resolved.model) models[tier] = modelRef(resolved.model);
+			} else if (resolved.ref !== undefined) {
+				models[tier] = resolved.ref;
+			}
 		}
 		let mainTreeDirty = false;
 		try {
@@ -1257,7 +1263,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			const { runs, mergeLog } = await runDelegation(plan, capturedState.packets, {
 				cwd: ctx.cwd,
 				runId: capturedState.id,
-				resolveModel: (tier) => resolveTierModel(ctx.modelRegistry, config, tierForExecutor(tier), undefined).ref,
+				resolveModel: (tier) => delegateModelRef(ctx.modelRegistry, config, tierForExecutor(tier), ctx.model),
 				signal,
 				maxParallel: loadMaxParallel(ctx.cwd),
 				onProgress: (progress) => {
@@ -1306,7 +1312,7 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			commit: (nextState, ctx) => setState(nextState, ctx),
 			resolveModel: (tier, ctx) => {
 				const config = loadTierConfig(ctx.cwd);
-				return resolveTierModel(ctx.modelRegistry, config, tierForExecutor(tier), undefined).ref;
+				return delegateModelRef(ctx.modelRegistry, config, tierForExecutor(tier), ctx.model);
 			},
 			escalate: runResumeEscalation,
 		} satisfies ResumeDeps),
@@ -1533,7 +1539,10 @@ export default function codeChanges(pi: ExtensionAPI): void {
 			const escalation = { phase: state.phase, question: params.question, evidence: params.evidence.slice(0, 2000), hypothesis: params.hypothesis, model: modelRef(resolved.model), decision };
 			state = { ...state, escalations: [...state.escalations, escalation] };
 			persist();
-			return { content: [{ type: "text", text: decision }], details: escalation };
+			const note = resolved.fellBack ? `(Escalation model "${resolved.ref}" was unavailable: ${resolved.reason === "no-auth" ? "no API key/login for its provider" : "could not be resolved"}; answered by the session model ${modelRef(resolved.model)}.)
+
+` : "";
+			return { content: [{ type: "text", text: note + decision }], details: escalation };
 		},
 	});
 
